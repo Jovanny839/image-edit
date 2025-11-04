@@ -71,12 +71,21 @@ app.add_middleware(
 )
 
 # Add CORS middleware
+# Note: When allow_credentials=True, you cannot use allow_origins=["*"]
+# Must specify explicit origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, replace with specific domains
+    allow_origins=[
+        "http://localhost:5173",  # Vite dev server
+        "http://localhost:3000",  # Common React dev port
+        "http://localhost:5174",  # Alternative Vite port
+        "https://image-edit-gray.vercel.app",  # Production frontend (if needed)
+        # Add your production frontend URL here when ready
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 # Global exception handler for better error handling
