@@ -113,14 +113,14 @@ class ImageRequest(BaseModel):
 
 # Request model for similarity comparison
 class SimilarityRequest(BaseModel):
-    image1_url: HttpUrl  # First image URL
-    image2_url: HttpUrl  # Second image URL
+    image1_url: HttpUrl  # First image URL (Supabase storage link)
+    image2_url: HttpUrl  # Second image URL (Supabase storage link)
     
     class Config:
         schema_extra = {
             "example": {
-                "image1_url": "https://example.com/image1.jpg",
-                "image2_url": "https://example.com/image2.jpg"
+                "image1_url": "https://your-project.supabase.co/storage/v1/object/public/images/image1.jpg",
+                "image2_url": "https://your-project.supabase.co/storage/v1/object/public/images/image2.jpg"
             }
         }
 
@@ -173,9 +173,21 @@ def get_content_type_from_url(url):
     else:
         return "image/jpeg"  # default fallback
 
+def is_supabase_url(url: str) -> bool:
+    """Check if URL is a Supabase storage URL"""
+    return "supabase.co/storage" in url.lower() or "supabase" in url.lower()
+
 def download_image_from_url(url):
-    """Download image from URL and return image data"""
+    """Download image from URL and return image data
+    
+    Supports both regular URLs and Supabase storage URLs.
+    For Supabase public storage URLs, no authentication is needed.
+    """
     try:
+        # Check if it's a Supabase URL for better logging
+        if is_supabase_url(url):
+            logger.info(f"Detected Supabase URL: {url}")
+        
         response = requests.get(url, timeout=30)
         response.raise_for_status()
         return response.content
@@ -409,17 +421,20 @@ async def compare_similarity_endpoint(request: SimilarityRequest):
     Uses CLIP-based embeddings to compare character identity between two images.
     Returns a similarity score between 0 and 1, where higher scores indicate
     greater similarity.
+    
+    Both image inputs should be Supabase storage URLs (public links).
+    Example: https://your-project.supabase.co/storage/v1/object/public/images/image.jpg
     """
     try:
         # Convert HttpUrl to string for processing
         image1_url_str = str(request.image1_url)
         image2_url_str = str(request.image2_url)
         
-        # Download both images from URLs
-        logger.info(f"Downloading image 1 from: {image1_url_str}")
+        # Download both images from Supabase URLs
+        logger.info(f"Downloading image 1 from Supabase: {image1_url_str}")
         image1_data = download_image_from_url(image1_url_str)
         
-        logger.info(f"Downloading image 2 from: {image2_url_str}")
+        logger.info(f"Downloading image 2 from Supabase: {image2_url_str}")
         image2_data = download_image_from_url(image2_url_str)
         
         # Convert image data to PIL Image objects
