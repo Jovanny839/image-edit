@@ -17,7 +17,7 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 from io import BytesIO
 from PIL import Image
-from similarity_compare import compare_similarity
+from similarity_compare import compare_character_similarity
 
 # Load environment variables
 load_dotenv()
@@ -140,23 +140,21 @@ class SimilarityRequest(BaseModel):
     class Config:
         schema_extra = {
             "example": {
-                "image_url1": "https://your-project.supabase.co/storage/v1/object/public/images/image1.jpg",
-                "image_url2": "https://your-project.supabase.co/storage/v1/object/public/images/image2.jpg"
+                "image1_url": "https://your-project.supabase.co/storage/v1/object/public/images/character1.jpg",
+                "image2_url": "https://your-project.supabase.co/storage/v1/object/public/images/character2.jpg"
             }
         }
 
 # Response model for similarity comparison
 class SimilarityResponse(BaseModel):
-    success: bool
     similarity_score: float
     message: str
     
     class Config:
         schema_extra = {
             "example": {
-                "success": True,
                 "similarity_score": 0.85,
-                "message": "Similarity comparison completed successfully"
+                "message": "Character similarity comparison completed successfully"
             }
         }
 
@@ -404,27 +402,58 @@ async def edit_image_stream_endpoint(request: ImageRequest):
 
 @app.post("/compare-similarity/", response_model=SimilarityResponse)
 async def compare_similarity_endpoint(request: SimilarityRequest):
-    """Compare similarity between two images from Supabase URLs"""
+    """
+    Compare two cartoon character images and return similarity score.
+    
+    This endpoint takes two Supabase image URLs and compares them using
+    character identity embeddings. The similarity score indicates how likely
+    the two images show the same character, even with different poses, emotions,
+    or backgrounds.
+    
+    Returns a similarity score between 0 and 1, where:
+    - ≥ 0.85: Very High - Same character
+    - ≥ 0.75: High - Same character (different pose/emotion)
+    - ≥ 0.65: Moderate - Possibly same character
+    - ≥ 0.50: Low - Unclear, needs review
+    - < 0.50: Very Low - Different characters
+    """
     try:
-        logger.info(f"Comparing similarity between: {request.image1_url} and {request.image2_url}")
         # Convert HttpUrl to string for processing
-        image_url1_str = str(request.image1_url)
-        image_url2_str = str(request.image2_url)
+        image1_url_str = str(request.image1_url)
+        image2_url_str = str(request.image2_url)
         
-        logger.info(f"Comparing similarity between: {image_url1_str} and {image_url2_str}")
+        # Download the images from the URLs provided
+        logger.info(f"Downloading image 1 from: {image1_url_str}")
+        image1_data = download_image_from_url(image1_url_str)
         
-        # Compare images using similarity_compare module
-        similarity_score = compare_similarity(image_url1_str, image_url2_str)
+        logger.info(f"Downloading image 2 from: {image2_url_str}")
+        image2_data = download_image_from_url(image2_url_str)
         
-        return SimilarityResponse(
-            success=True,
-            similarity_score=similarity_score,
-            message="Similarity comparison completed successfully"
+        # Convert image data to PIL Image objects
+        logger.info("Converting images to PIL Image objects...")
+        image1 = Image.open(BytesIO(image1_data))
+        if image1.mode != 'RGB':
+            image1 = image1.convert('RGB')
+        
+        image2 = Image.open(BytesIO(image2_data))
+        if image2.mode != 'RGB':
+            image2 = image2.convert('RGB')
+        
+        # Compare character similarity using the similarity_compare module
+        logger.info("Comparing character similarity...")
+        similarity_score = compare_character_similarity(
+            image1,
+            image2,
+            verbose=False
         )
         
-    except ValueError as e:
-        logger.error(f"Validation error in compare_similarity_endpoint: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.info(f"Similarity score: {similarity_score:.4f}")
+        
+        return SimilarityResponse(
+            similarity_score=similarity_score,
+            message="Character similarity comparison completed successfully"
+        )
+            
     except HTTPException as e:
         logger.error(f"HTTP Exception: {e.detail}")
         raise e
