@@ -426,6 +426,7 @@ async def compare_similarity_endpoint(request: SimilarityRequest):
     Example: https://your-project.supabase.co/storage/v1/object/public/images/image.jpg
     """
     try:
+        print(request)
         # Convert HttpUrl to string for processing
         image1_url_str = str(request.image1_url)
         image2_url_str = str(request.image2_url)
