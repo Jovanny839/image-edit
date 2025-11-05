@@ -16,6 +16,7 @@ from datetime import datetime
 from supabase import create_client, Client
 from dotenv import load_dotenv
 from PIL import Image
+from similarity_compare import compare_character_similarity
 
 # Load environment variables
 load_dotenv()
@@ -23,19 +24,6 @@ load_dotenv()
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# Lazy import for similarity_compare to prevent startup failures if dependencies are missing
-# This allows the app to start even if torch/clip are not installed
-compare_character_similarity = None
-SIMILARITY_AVAILABLE = False
-try:
-    from similarity_compare import compare_character_similarity
-    SIMILARITY_AVAILABLE = True
-    logger.info("✅ Similarity comparison module loaded successfully")
-except ImportError as e:
-    SIMILARITY_AVAILABLE = False
-    logger.warning(f"⚠️ Similarity comparison module not available: {e}")
-    logger.warning("⚠️ Install torch and clip packages to enable similarity comparison")
 
 # === CONFIG ===
 API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -83,21 +71,12 @@ app.add_middleware(
 )
 
 # Add CORS middleware
-# Note: When allow_credentials=True, you cannot use allow_origins=["*"]
-# Must specify explicit origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",  # Vite dev server
-        "http://localhost:3000",  # Common React dev port
-        "http://localhost:5174",  # Alternative Vite port
-        "https://image-edit-gray.vercel.app",  # Production frontend (if needed)
-        # Add your production frontend URL here when ready
-    ],
+    allow_origins=["*"],  # In production, replace with specific domains
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["*"],
 )
 
 # Global exception handler for better error handling
@@ -352,8 +331,7 @@ async def health_check():
         "timestamp": time.time(),
         "api_key_configured": bool(API_KEY and API_KEY.startswith("sk-")),
         "supabase_configured": bool(supabase is not None),
-        "storage_bucket": STORAGE_BUCKET if supabase else None,
-        "similarity_available": SIMILARITY_AVAILABLE
+        "storage_bucket": STORAGE_BUCKET if supabase else None
     }
 
 @app.post("/edit-image/", response_model=ImageResponse)
@@ -447,13 +425,6 @@ async def compare_similarity_endpoint(request: SimilarityRequest):
     Both image inputs should be Supabase storage URLs (public links).
     Example: https://your-project.supabase.co/storage/v1/object/public/images/image.jpg
     """
-    # Check if similarity comparison is available
-    if not SIMILARITY_AVAILABLE or compare_character_similarity is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Similarity comparison service is not available. Required dependencies (torch, clip) may not be installed."
-        )
-    
     try:
         # Convert HttpUrl to string for processing
         image1_url_str = str(request.image1_url)
@@ -496,9 +467,7 @@ async def compare_similarity_endpoint(request: SimilarityRequest):
         raise e
     except Exception as e:
         logger.error(f"Unexpected error in compare_similarity_endpoint: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
 
 if __name__ == "__main__":
     print("🚀 Starting AI Image Editor Server...")
