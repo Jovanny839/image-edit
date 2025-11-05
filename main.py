@@ -15,8 +15,8 @@ import uuid
 from datetime import datetime
 from supabase import create_client, Client
 from dotenv import load_dotenv
+from io import BytesIO
 from PIL import Image
-from similarity_compare import compare_character_similarity
 
 # Load environment variables
 load_dotenv()
@@ -108,34 +108,6 @@ class ImageRequest(BaseModel):
             "example": {
                 "image_url": "https://example.com/image.jpg",
                 "prompt": "Make this image more colorful and vibrant"
-            }
-        }
-
-# Request model for similarity comparison
-class SimilarityRequest(BaseModel):
-    image1_url: HttpUrl  # First image URL
-    image2_url: HttpUrl  # Second image URL
-    
-    class Config:
-        schema_extra = {
-            "example": {
-                "image1_url": "https://example.com/image1.jpg",
-                "image2_url": "https://example.com/image2.jpg"
-            }
-        }
-
-# Response model for similarity comparison
-class SimilarityResponse(BaseModel):
-    success: bool
-    similarity_score: float
-    message: str
-    
-    class Config:
-        schema_extra = {
-            "example": {
-                "success": True,
-                "similarity_score": 0.85,
-                "message": "Images compared successfully"
             }
         }
 
@@ -399,59 +371,6 @@ async def edit_image_stream_endpoint(request: ImageRequest):
         raise e
     except Exception as e:
         logger.error(f"Unexpected error in edit_image_stream_endpoint: {e}")
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
-
-@app.post("/compare-similarity/", response_model=SimilarityResponse)
-async def compare_similarity_endpoint(request: SimilarityRequest):
-    """
-    Compare two images and return their similarity score.
-    
-    Uses CLIP-based embeddings to compare character identity between two images.
-    Returns a similarity score between 0 and 1, where higher scores indicate
-    greater similarity.
-    """
-    try:
-        # Convert HttpUrl to string for processing
-        image1_url_str = str(request.image1_url)
-        image2_url_str = str(request.image2_url)
-        
-        # Download both images from URLs
-        logger.info(f"Downloading image 1 from: {image1_url_str}")
-        image1_data = download_image_from_url(image1_url_str)
-        
-        logger.info(f"Downloading image 2 from: {image2_url_str}")
-        image2_data = download_image_from_url(image2_url_str)
-        
-        # Convert image data to PIL Image objects
-        image1 = Image.open(BytesIO(image1_data))
-        if image1.mode != 'RGB':
-            image1 = image1.convert('RGB')
-        
-        image2 = Image.open(BytesIO(image2_data))
-        if image2.mode != 'RGB':
-            image2 = image2.convert('RGB')
-        
-        # Compare images using similarity_compare module
-        logger.info("Comparing images using similarity_compare module...")
-        similarity_score = compare_character_similarity(
-            image1, 
-            image2,
-            verbose=False
-        )
-        
-        logger.info(f"Similarity score calculated: {similarity_score:.4f}")
-        
-        return SimilarityResponse(
-            success=True,
-            similarity_score=similarity_score,
-            message=f"Images compared successfully. Similarity score: {similarity_score:.4f}"
-        )
-        
-    except HTTPException as e:
-        logger.error(f"HTTP Exception: {e.detail}")
-        raise e
-    except Exception as e:
-        logger.error(f"Unexpected error in compare_similarity_endpoint: {e}")
         raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
 
 if __name__ == "__main__":
