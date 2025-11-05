@@ -16,7 +16,6 @@ from datetime import datetime
 from supabase import create_client, Client
 from dotenv import load_dotenv
 from PIL import Image
-from similarity_compare import compare_character_similarity
 
 # Load environment variables
 load_dotenv()
@@ -24,6 +23,19 @@ load_dotenv()
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Lazy import for similarity_compare to prevent startup failures if dependencies are missing
+# This allows the app to start even if torch/clip are not installed
+compare_character_similarity = None
+SIMILARITY_AVAILABLE = False
+try:
+    from similarity_compare import compare_character_similarity
+    SIMILARITY_AVAILABLE = True
+    logger.info("✅ Similarity comparison module loaded successfully")
+except ImportError as e:
+    SIMILARITY_AVAILABLE = False
+    logger.warning(f"⚠️ Similarity comparison module not available: {e}")
+    logger.warning("⚠️ Install torch and clip packages to enable similarity comparison")
 
 # === CONFIG ===
 API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -340,7 +352,8 @@ async def health_check():
         "timestamp": time.time(),
         "api_key_configured": bool(API_KEY and API_KEY.startswith("sk-")),
         "supabase_configured": bool(supabase is not None),
-        "storage_bucket": STORAGE_BUCKET if supabase else None
+        "storage_bucket": STORAGE_BUCKET if supabase else None,
+        "similarity_available": SIMILARITY_AVAILABLE
     }
 
 @app.post("/edit-image/", response_model=ImageResponse)
@@ -434,6 +447,13 @@ async def compare_similarity_endpoint(request: SimilarityRequest):
     Both image inputs should be Supabase storage URLs (public links).
     Example: https://your-project.supabase.co/storage/v1/object/public/images/image.jpg
     """
+    # Check if similarity comparison is available
+    if not SIMILARITY_AVAILABLE or compare_character_similarity is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Similarity comparison service is not available. Required dependencies (torch, clip) may not be installed."
+        )
+    
     try:
         # Convert HttpUrl to string for processing
         image1_url_str = str(request.image1_url)
@@ -476,7 +496,9 @@ async def compare_similarity_endpoint(request: SimilarityRequest):
         raise e
     except Exception as e:
         logger.error(f"Unexpected error in compare_similarity_endpoint: {e}")
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
 if __name__ == "__main__":
     print("🚀 Starting AI Image Editor Server...")

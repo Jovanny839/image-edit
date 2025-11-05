@@ -5,3 +5,12 @@ uvicorn==0.36.0
 supabase==2.19.0
 python-dotenv==1.1.1
 Pillow==10.4.0
+# ML dependencies for similarity comparison (optional - app will work without them)
+# Note: PyTorch is large (~2GB). For Vercel/serverless, consider using CPU-only version
+# or deploying similarity comparison as a separate service
+torch>=2.0.0,<3.0.0; platform_machine != "aarch64"
+# For ARM64 (Apple Silicon), use: torch>=2.0.0; platform_machine == "aarch64"
+ftfy>=6.1.1
+regex>=2023.0.0
+tqdm>=4.65.0
+git+https://github.com/openai/CLIP.git
