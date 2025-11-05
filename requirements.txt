@@ -10,6 +10,9 @@ ftfy
 regex
 tqdm
 numpy>=1.24.0
-opencv-python>=4.8.0
-mediapipe>=0.10.0
+
+# Optional dependencies for face detection (install separately if needed)
+# opencv-python>=4.8.0
+# mediapipe>=0.10.0
+
 git+https://github.com/openai/CLIP.git
