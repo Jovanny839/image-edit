@@ -17,7 +17,6 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 from io import BytesIO
 from PIL import Image
-from similarity_compare import compare_character_similarity
 
 # Load environment variables
 load_dotenv()
@@ -25,6 +24,33 @@ load_dotenv()
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Import similarity_compare with error handling for serverless environments
+SIMILARITY_AVAILABLE = False
+compare_character_similarity = None
+
+try:
+    # Try importing required dependencies first
+    import torch
+    import clip
+    import numpy as np
+    logger.info("Core dependencies (torch, clip, numpy) available")
+    
+    # Now try importing the similarity module
+    from similarity_compare import compare_character_similarity
+    SIMILARITY_AVAILABLE = True
+    logger.info("Similarity comparison module loaded successfully")
+except ImportError as e:
+    logger.warning(f"similarity_compare module or dependencies not available: {e}")
+    logger.warning("Install with: pip install torch torchvision git+https://github.com/openai/CLIP.git numpy")
+    SIMILARITY_AVAILABLE = False
+    compare_character_similarity = None
+except Exception as e:
+    logger.error(f"Error importing similarity_compare: {e}")
+    import traceback
+    logger.error(traceback.format_exc())
+    SIMILARITY_AVAILABLE = False
+    compare_character_similarity = None
 
 # === CONFIG ===
 API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -404,7 +430,6 @@ async def edit_image_stream_endpoint(request: ImageRequest):
 
 @app.post("/compare_similarity/")
 async def compare_similarity_endpoint(request: SimilarityRequest):
-    print("+++++++++++++++++++", request)
     """
     Compare similarity between two images from Supabase URLs.
     
@@ -412,33 +437,83 @@ async def compare_similarity_endpoint(request: SimilarityRequest):
     more similar images (typically same character/object).
     """
     try:
+        # Check if similarity module is available
+        if not SIMILARITY_AVAILABLE or compare_character_similarity is None:
+            logger.error("Similarity comparison module is not available")
+            raise HTTPException(
+                status_code=503,
+                detail="Similarity comparison service is not available. Required dependencies (torch, clip) may be missing."
+            )
+        
         # Convert HttpUrl to string for processing
         image1_url_str = str(request.image1_url)
         image2_url_str = str(request.image2_url)
         
         # Download both images from Supabase URLs
         logger.info(f"Downloading image 1 from: {image1_url_str}")
-        image1_data = download_image_from_url(image1_url_str)
+        try:
+            image1_data = download_image_from_url(image1_url_str)
+        except Exception as e:
+            logger.error(f"Failed to download image 1: {e}")
+            raise HTTPException(status_code=400, detail=f"Failed to download image 1 from URL: {str(e)}")
         
         logger.info(f"Downloading image 2 from: {image2_url_str}")
-        image2_data = download_image_from_url(image2_url_str)
+        try:
+            image2_data = download_image_from_url(image2_url_str)
+        except Exception as e:
+            logger.error(f"Failed to download image 2: {e}")
+            raise HTTPException(status_code=400, detail=f"Failed to download image 2 from URL: {str(e)}")
         
         # Convert image data to PIL Images
-        image1 = Image.open(BytesIO(image1_data))
-        if image1.mode != 'RGB':
-            image1 = image1.convert('RGB')
+        try:
+            image1 = Image.open(BytesIO(image1_data))
+            if image1.mode != 'RGB':
+                image1 = image1.convert('RGB')
+        except Exception as e:
+            logger.error(f"Failed to process image 1: {e}")
+            raise HTTPException(status_code=400, detail=f"Failed to process image 1: {str(e)}")
         
-        image2 = Image.open(BytesIO(image2_data))
-        if image2.mode != 'RGB':
-            image2 = image2.convert('RGB')
+        try:
+            image2 = Image.open(BytesIO(image2_data))
+            if image2.mode != 'RGB':
+                image2 = image2.convert('RGB')
+        except Exception as e:
+            logger.error(f"Failed to process image 2: {e}")
+            raise HTTPException(status_code=400, detail=f"Failed to process image 2: {str(e)}")
         
         # Compare images using similarity_compare module
         logger.info("Comparing images using similarity_compare module...")
-        similarity_score = compare_character_similarity(
-            image1, 
-            image2, 
-            verbose=False
-        )
+        try:
+            # Note: First call will load the CLIP model, which may take time
+            # In serverless, ensure enough memory and timeout allowance
+            similarity_score = compare_character_similarity(
+                image1, 
+                image2, 
+                verbose=False,
+                device='cpu'  # Use CPU for serverless (no GPU typically available)
+            )
+        except RuntimeError as e:
+            logger.error(f"Runtime error during similarity comparison: {e}")
+            error_msg = str(e)
+            # Check if it's a model loading issue
+            if "CLIP" in error_msg or "model" in error_msg.lower() or "out of memory" in error_msg.lower():
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Model loading failed. This may be a serverless environment issue (memory/timeout). Error: {error_msg}"
+                )
+            raise HTTPException(status_code=500, detail=f"Similarity comparison failed: {error_msg}")
+        except OSError as e:
+            # Network or file system errors (e.g., model download timeout)
+            logger.error(f"OS error during similarity comparison: {e}")
+            raise HTTPException(
+                status_code=503,
+                detail=f"Model download or file system error. This may be a serverless timeout issue. Error: {str(e)}"
+            )
+        except Exception as e:
+            logger.error(f"Error during similarity comparison: {type(e).__name__}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=f"Similarity comparison error: {str(e)}")
         
         logger.info(f"Similarity score: {similarity_score:.4f}")
         
@@ -452,8 +527,10 @@ async def compare_similarity_endpoint(request: SimilarityRequest):
         logger.error(f"HTTP Exception: {e.detail}")
         raise e
     except Exception as e:
-        logger.error(f"Unexpected error in compare_similarity_endpoint: {e}")
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
+        logger.error(f"Unexpected error in compare_similarity_endpoint: {type(e).__name__}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
 if __name__ == "__main__":
     print("🚀 Starting AI Image Editor Server...")
