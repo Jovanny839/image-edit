@@ -17,6 +17,7 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 from io import BytesIO
 from PIL import Image
+from similarity_compare import compare_character_similarity
 
 # Load environment variables
 load_dotenv()
@@ -128,6 +129,34 @@ class ImageResponse(BaseModel):
                     "filename": "edited_image_123.jpg",
                     "bucket": "images"
                 }
+            }
+        }
+
+# Request model for similarity comparison
+class SimilarityRequest(BaseModel):
+    image1_url: HttpUrl
+    image2_url: HttpUrl
+    
+    class Config:
+        schema_extra = {
+            "example": {
+                "image1_url": "https://your-project.supabase.co/storage/v1/object/public/images/image1.jpg",
+                "image2_url": "https://your-project.supabase.co/storage/v1/object/public/images/image2.jpg"
+            }
+        }
+
+# Response model for similarity comparison
+class SimilarityResponse(BaseModel):
+    similarity_score: float
+    image1_url: str
+    image2_url: str
+    
+    class Config:
+        schema_extra = {
+            "example": {
+                "similarity_score": 0.85,
+                "image1_url": "https://your-project.supabase.co/storage/v1/object/public/images/image1.jpg",
+                "image2_url": "https://your-project.supabase.co/storage/v1/object/public/images/image2.jpg"
             }
         }
 
@@ -371,6 +400,59 @@ async def edit_image_stream_endpoint(request: ImageRequest):
         raise e
     except Exception as e:
         logger.error(f"Unexpected error in edit_image_stream_endpoint: {e}")
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
+
+@app.post("/compare_similarity/")
+async def compare_similarity_endpoint(request: SimilarityRequest):
+    print("+++++++++++++++++++", request)
+    """
+    Compare similarity between two images from Supabase URLs.
+    
+    Returns a similarity score between 0 and 1, where higher scores indicate
+    more similar images (typically same character/object).
+    """
+    try:
+        # Convert HttpUrl to string for processing
+        image1_url_str = str(request.image1_url)
+        image2_url_str = str(request.image2_url)
+        
+        # Download both images from Supabase URLs
+        logger.info(f"Downloading image 1 from: {image1_url_str}")
+        image1_data = download_image_from_url(image1_url_str)
+        
+        logger.info(f"Downloading image 2 from: {image2_url_str}")
+        image2_data = download_image_from_url(image2_url_str)
+        
+        # Convert image data to PIL Images
+        image1 = Image.open(BytesIO(image1_data))
+        if image1.mode != 'RGB':
+            image1 = image1.convert('RGB')
+        
+        image2 = Image.open(BytesIO(image2_data))
+        if image2.mode != 'RGB':
+            image2 = image2.convert('RGB')
+        
+        # Compare images using similarity_compare module
+        logger.info("Comparing images using similarity_compare module...")
+        similarity_score = compare_character_similarity(
+            image1, 
+            image2, 
+            verbose=False
+        )
+        
+        logger.info(f"Similarity score: {similarity_score:.4f}")
+        
+        return SimilarityResponse(
+            similarity_score=float(similarity_score),
+            image1_url=image1_url_str,
+            image2_url=image2_url_str
+        )
+        
+    except HTTPException as e:
+        logger.error(f"HTTP Exception: {e.detail}")
+        raise e
+    except Exception as e:
+        logger.error(f"Unexpected error in compare_similarity_endpoint: {e}")
         raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
 
 if __name__ == "__main__":
