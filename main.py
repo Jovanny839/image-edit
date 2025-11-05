@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
@@ -97,14 +97,26 @@ app.add_middleware(
     allowed_hosts=["*"]  # In production, specify actual domains
 )
 
+
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # In production, replace with specific domains
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
+
+# Additional middleware to ensure CORS headers are always present (for serverless environments)
+@app.middleware("http")
+async def add_cors_header(request: Request, call_next):
+    """Add CORS headers to all responses for serverless compatibility"""
+    response = await call_next(request)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS, PATCH"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, Accept"
+    return response
 
 # Global exception handler for better error handling
 @app.exception_handler(Exception)
@@ -112,7 +124,12 @@ async def global_exception_handler(request: Request, exc: Exception):
     logger.error(f"Global exception handler caught: {exc}")
     return JSONResponse(
         status_code=500,
-        content={"detail": "Internal server error occurred"}
+        content={"detail": "Internal server error occurred"},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept",
+        }
     )
 
 # Handle validation errors
@@ -428,7 +445,20 @@ async def edit_image_stream_endpoint(request: ImageRequest):
         logger.error(f"Unexpected error in edit_image_stream_endpoint: {e}")
         raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
 
-@app.post("/compare_similarity/")
+@app.options("/compare-similarity/")
+async def compare_similarity_options():
+    """Handle preflight OPTIONS request for CORS"""
+    return Response(
+        status_code=200,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept",
+            "Access-Control-Max-Age": "3600",
+        }
+    )
+
+@app.post("/compare-similarity/")
 async def compare_similarity_endpoint(request: SimilarityRequest):
     """
     Compare similarity between two images from Supabase URLs.
@@ -517,10 +547,20 @@ async def compare_similarity_endpoint(request: SimilarityRequest):
         
         logger.info(f"Similarity score: {similarity_score:.4f}")
         
-        return SimilarityResponse(
+        response_data = SimilarityResponse(
             similarity_score=float(similarity_score),
             image1_url=image1_url_str,
             image2_url=image2_url_str
+        )
+        
+        # Add CORS headers explicitly for serverless environments
+        return JSONResponse(
+            content=response_data.dict(),
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "POST, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept",
+            }
         )
         
     except HTTPException as e:
