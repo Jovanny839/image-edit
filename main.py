@@ -17,6 +17,7 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 from io import BytesIO
 from PIL import Image
+from similarity_compare import compare_similarity
 
 # Load environment variables
 load_dotenv()
@@ -128,6 +129,34 @@ class ImageResponse(BaseModel):
                     "filename": "edited_image_123.jpg",
                     "bucket": "images"
                 }
+            }
+        }
+
+# Request model for similarity comparison
+class SimilarityRequest(BaseModel):
+    image1_url: HttpUrl
+    image2_url: HttpUrl
+    
+    class Config:
+        schema_extra = {
+            "example": {
+                "image_url1": "https://your-project.supabase.co/storage/v1/object/public/images/image1.jpg",
+                "image_url2": "https://your-project.supabase.co/storage/v1/object/public/images/image2.jpg"
+            }
+        }
+
+# Response model for similarity comparison
+class SimilarityResponse(BaseModel):
+    success: bool
+    similarity_score: float
+    message: str
+    
+    class Config:
+        schema_extra = {
+            "example": {
+                "success": True,
+                "similarity_score": 0.85,
+                "message": "Similarity comparison completed successfully"
             }
         }
 
@@ -371,6 +400,36 @@ async def edit_image_stream_endpoint(request: ImageRequest):
         raise e
     except Exception as e:
         logger.error(f"Unexpected error in edit_image_stream_endpoint: {e}")
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
+
+@app.post("/compare-similarity/", response_model=SimilarityResponse)
+async def compare_similarity_endpoint(request: SimilarityRequest):
+    """Compare similarity between two images from Supabase URLs"""
+    try:
+        logger.info(f"Comparing similarity between: {request.image1_url} and {request.image2_url}")
+        # Convert HttpUrl to string for processing
+        image_url1_str = str(request.image1_url)
+        image_url2_str = str(request.image2_url)
+        
+        logger.info(f"Comparing similarity between: {image_url1_str} and {image_url2_str}")
+        
+        # Compare images using similarity_compare module
+        similarity_score = compare_similarity(image_url1_str, image_url2_str)
+        
+        return SimilarityResponse(
+            success=True,
+            similarity_score=similarity_score,
+            message="Similarity comparison completed successfully"
+        )
+        
+    except ValueError as e:
+        logger.error(f"Validation error in compare_similarity_endpoint: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException as e:
+        logger.error(f"HTTP Exception: {e.detail}")
+        raise e
+    except Exception as e:
+        logger.error(f"Unexpected error in compare_similarity_endpoint: {e}")
         raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
 
 if __name__ == "__main__":
