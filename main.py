@@ -17,7 +17,6 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 from io import BytesIO
 from PIL import Image
-from similarity_compare import compare_character_similarity
 
 # Load environment variables
 load_dotenv()
@@ -129,32 +128,6 @@ class ImageResponse(BaseModel):
                     "filename": "edited_image_123.jpg",
                     "bucket": "images"
                 }
-            }
-        }
-
-# Request model for similarity comparison
-class SimilarityRequest(BaseModel):
-    image1_url: HttpUrl
-    image2_url: HttpUrl
-    
-    class Config:
-        schema_extra = {
-            "example": {
-                "image1_url": "https://your-project.supabase.co/storage/v1/object/public/images/character1.jpg",
-                "image2_url": "https://your-project.supabase.co/storage/v1/object/public/images/character2.jpg"
-            }
-        }
-
-# Response model for similarity comparison
-class SimilarityResponse(BaseModel):
-    similarity_score: float
-    message: str
-    
-    class Config:
-        schema_extra = {
-            "example": {
-                "similarity_score": 0.85,
-                "message": "Character similarity comparison completed successfully"
             }
         }
 
@@ -400,82 +373,17 @@ async def edit_image_stream_endpoint(request: ImageRequest):
         logger.error(f"Unexpected error in edit_image_stream_endpoint: {e}")
         raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
 
-@app.post("/compare-similarity/", response_model=SimilarityResponse)
-async def compare_similarity_endpoint(request: SimilarityRequest):
-    """
-    Compare two cartoon character images and return similarity score.
-    
-    This endpoint takes two Supabase image URLs and compares them using
-    character identity embeddings. The similarity score indicates how likely
-    the two images show the same character, even with different poses, emotions,
-    or backgrounds.
-    
-    Returns a similarity score between 0 and 1, where:
-    - ≥ 0.85: Very High - Same character
-    - ≥ 0.75: High - Same character (different pose/emotion)
-    - ≥ 0.65: Moderate - Possibly same character
-    - ≥ 0.50: Low - Unclear, needs review
-    - < 0.50: Very Low - Different characters
-    """
-    try:
-        # Convert HttpUrl to string for processing
-        image1_url_str = str(request.image1_url)
-        image2_url_str = str(request.image2_url)
-        
-        # Download the images from the URLs provided
-        logger.info(f"Downloading image 1 from: {image1_url_str}")
-        image1_data = download_image_from_url(image1_url_str)
-        
-        logger.info(f"Downloading image 2 from: {image2_url_str}")
-        image2_data = download_image_from_url(image2_url_str)
-        
-        # Convert image data to PIL Image objects
-        logger.info("Converting images to PIL Image objects...")
-        image1 = Image.open(BytesIO(image1_data))
-        if image1.mode != 'RGB':
-            image1 = image1.convert('RGB')
-        
-        image2 = Image.open(BytesIO(image2_data))
-        if image2.mode != 'RGB':
-            image2 = image2.convert('RGB')
-        
-        # Compare character similarity using the similarity_compare module
-        logger.info("Comparing character similarity...")
-        similarity_score = compare_character_similarity(
-            image1,
-            image2,
-            verbose=False
-        )
-        
-        logger.info(f"Similarity score: {similarity_score:.4f}")
-        
-        return SimilarityResponse(
-            similarity_score=similarity_score,
-            message="Character similarity comparison completed successfully"
-        )
-            
-    except HTTPException as e:
-        logger.error(f"HTTP Exception: {e.detail}")
-        raise e
-    except Exception as e:
-        logger.error(f"Unexpected error in compare_similarity_endpoint: {e}")
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
-
 if __name__ == "__main__":
-    # Get port from environment variable (Render sets this) or default to 8000 for local development
-    port = int(os.getenv("PORT", 8000))
-    reload = os.getenv("ENVIRONMENT", "development") == "development"
-    
     print("🚀 Starting AI Image Editor Server...")
-    print(f"📚 API Documentation: http://localhost:{port}/docs")
-    print(f"🔍 Health Check: http://localhost:{port}/health")
-    print(f"⚡ Server running on: http://localhost:{port}")
+    print("📚 API Documentation: http://localhost:8000/docs")
+    print("🔍 Health Check: http://localhost:8000/health")
+    print("⚡ Server running on: http://localhost:8000")
     
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=port,
-        reload=reload,
+        port=8000,
+        reload=True,
         log_level="info",
         access_log=True,
         server_header=False,
