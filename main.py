@@ -4,11 +4,9 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, HttpUrl
 import os
-import base64
 import requests
 import time
 import uvicorn
-import re
 from io import BytesIO
 from fastapi.responses import StreamingResponse
 import logging
@@ -16,8 +14,7 @@ import uuid
 from datetime import datetime
 from supabase import create_client, Client
 from dotenv import load_dotenv
-from PIL import Image
-import google.generativeai as genai
+from image_generator import ImageGenerator
 
 # Load environment variables
 load_dotenv()
@@ -31,13 +28,14 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 MODEL = "gemini-3-pro-image-preview"
 OUTPUT_FILE = "edited_image.png"
 
-# Configure Google Generative AI
+# Initialize Image Generator
+image_generator: ImageGenerator = None
 if GOOGLE_API_KEY:
     try:
-        genai.configure(api_key=GOOGLE_API_KEY)
-        logger.info("✅ Google Generative AI configured successfully")
+        image_generator = ImageGenerator(api_key=GOOGLE_API_KEY, model_name=MODEL)
+        logger.info("✅ Image Generator initialized successfully")
     except Exception as e:
-        logger.error(f"❌ Failed to configure Google Generative AI: {e}")
+        logger.error(f"❌ Failed to initialize Image Generator: {e}")
 else:
     logger.warning("⚠️ GOOGLE_API_KEY not found in environment variables")
 
@@ -218,97 +216,21 @@ def upload_to_supabase(image_data: bytes, filename: str) -> dict:
         return {"uploaded": False, "url": None, "message": f"Upload error: {e}"}
 
 def edit_image(image_data, prompt, image_url=None):
-    """Send image to Google Generative AI API for editing using nano-banana-pro model"""
-    if not GOOGLE_API_KEY:
-        raise HTTPException(status_code=500, detail="Google API key not configured")
+    """Edit image using the ImageGenerator library"""
+    if not image_generator:
+        raise HTTPException(status_code=500, detail="Image Generator not configured. Please set GOOGLE_API_KEY environment variable.")
     
     try:
-        # Initialize the model
-        model = genai.GenerativeModel(MODEL)
-        
-        # Create PIL Image from bytes for Google API
-        image = Image.open(BytesIO(image_data))
-        
-        # Prepare the prompt with image editing instruction
-        full_prompt = f"Edit this image according to the following instruction: {prompt}. Generate and return the edited image."
-        
-        logger.info(f"Sending request to Google Generative AI ({MODEL})...")
-        start_time = time.time()
-        
-        # Generate content with image and prompt
-        # For image editing, we pass both the image and the prompt
-        response = model.generate_content([image, full_prompt])
-        elapsed = time.time() - start_time
-        logger.info(f"Received response from Google API in {elapsed:.2f} seconds")
-        
-        # Handle different response formats from Google API
-        # Check if response has candidates with content
-        if hasattr(response, 'candidates') and response.candidates:
-            candidate = response.candidates[0]
-            if hasattr(candidate, 'content') and hasattr(candidate.content, 'parts'):
-                for part in candidate.content.parts:
-                    # Check for inline data (base64 encoded image)
-                    if hasattr(part, 'inline_data') and part.inline_data:
-                        if hasattr(part.inline_data, 'data'):
-                            image_bytes = base64.b64decode(part.inline_data.data)
-                            return image_bytes
-                    # Check for image object
-                    if hasattr(part, 'image') and part.image:
-                        image_buffer = BytesIO()
-                        part.image.save(image_buffer, format='PNG')
-                        image_buffer.seek(0)  # Reset position before getting value
-                        return image_buffer.getvalue()
-        
-        # Check if response has parts directly
-        if hasattr(response, 'parts') and response.parts:
-            for part in response.parts:
-                if hasattr(part, 'inline_data') and part.inline_data:
-                    if hasattr(part.inline_data, 'data'):
-                        image_bytes = base64.b64decode(part.inline_data.data)
-                        return image_bytes
-                if hasattr(part, 'image') and part.image:
-                    image_buffer = BytesIO()
-                    part.image.save(image_buffer, format='PNG')
-                    image_buffer.seek(0)  # Reset position before getting value
-                    return image_buffer.getvalue()
-        
-        # Check if response has images attribute
-        if hasattr(response, 'images') and response.images:
-            generated_image = response.images[0]
-            image_buffer = BytesIO()
-            if isinstance(generated_image, Image.Image):
-                generated_image.save(image_buffer, format='PNG')
-                image_buffer.seek(0)  # Reset position before getting value
-                return image_buffer.getvalue()
-            elif isinstance(generated_image, bytes):
-                return generated_image
-            else:
-                # If it's not bytes or Image, log warning and try to convert
-                logger.warning(f"Unexpected image type from response.images: {type(generated_image)}")
-                raise ValueError(f"Unsupported image format in response: {type(generated_image)}")
-        
-        # If response contains text, try to extract base64 image data
-        if hasattr(response, 'text') and response.text:
-            # Try to find base64 image data in the text
-            base64_match = re.search(r'data:image/[^;]+;base64,([A-Za-z0-9+/=]+)', response.text)
-            if base64_match:
-                image_bytes = base64.b64decode(base64_match.group(1))
-                return image_bytes
-            # Log the text response for debugging
-            logger.warning(f"API returned text instead of image: {response.text[:200]}")
-        
-        # If we can't find an image, log the full response structure for debugging
-        logger.error(f"Could not extract image from response. Response type: {type(response)}, Attributes: {dir(response)}")
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Unexpected response from Google API. Could not extract image from response. Response type: {type(response)}"
-        )
-        
-    except HTTPException:
-        raise
+        # Use the image generator library to generate/edit the image
+        edited_image_bytes = image_generator.generate_image(image_data, prompt)
+        return edited_image_bytes
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
-        logger.error(f"Error calling Google Generative AI: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error from Google API: {str(e)}")
+        logger.error(f"Unexpected error in edit_image: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
 @app.get("/")
 async def root():
@@ -328,6 +250,7 @@ async def health_check():
         "timestamp": time.time(),
         "api_key_configured": bool(GOOGLE_API_KEY),
         "model": MODEL,
+        "image_generator_configured": bool(image_generator is not None),
         "supabase_configured": bool(supabase is not None),
         "storage_bucket": STORAGE_BUCKET if supabase else None
     }
