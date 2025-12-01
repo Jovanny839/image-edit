@@ -4,7 +4,6 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, HttpUrl
 import os
-import base64
 import requests
 import time
 import uvicorn
@@ -17,6 +16,9 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 from io import BytesIO
 from PIL import Image
+from google import genai
+from google.genai import types
+
 
 # Load environment variables
 load_dotenv()
@@ -26,10 +28,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # === CONFIG ===
-API_KEY = os.getenv("OPENAI_API_KEY", "")
-ENDPOINT = "https://api.openai.com/v1/images/edits"
-MODEL = "gpt-image-1"
-OUTPUT_FILE = "edited_image.png"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+MODEL = "gemini-3-pro-image-preview"
 
 # Supabase Configuration
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -37,7 +37,17 @@ SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")  # Service role key for storage operations
 STORAGE_BUCKET = "images"
 
-# Initialize Supabase client
+# Initialize Gemini client
+gemini_client = None
+if GEMINI_API_KEY:
+    try:
+        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+        logger.info("✅ Gemini client initialized successfully")
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize Gemini client: {e}")
+else:
+    logger.warning("⚠️ GEMINI_API_KEY not found. Image generation will be disabled.")
+
 supabase: Client = None
 if SUPABASE_URL:
     # Try service key first (bypasses RLS), then anon key
@@ -58,7 +68,7 @@ else:
 # FastAPI app
 app = FastAPI(
     title="AI Image Editor API",
-    description="API for editing images using OpenAI's image editing capabilities",
+    description="API for editing images using Google Gemini's image generation capabilities",
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc"
@@ -228,50 +238,56 @@ def upload_to_supabase(image_data: bytes, filename: str) -> dict:
         return {"uploaded": False, "url": None, "message": f"Upload error: {e}"}
 
 def edit_image(image_data, prompt, image_url=None):
-    """Send image to OpenAI API for editing"""
-    headers = {"Authorization": f"Bearer {API_KEY}"}
-
-    # Prepare files for upload
-    # Determine content type from URL if provided, otherwise default to jpeg
-    if image_url:
-        image_content_type = get_content_type_from_url(image_url)
-    else:
-        image_content_type = "image/png"  # default fallback
-
-    files = {"image": ("image", image_data, image_content_type)}
-
-    data = {
-        "model": MODEL,
-        "prompt": prompt,
-        "n": "1",
-        "size": "auto"
-    }
-
-    print("Sending request to OpenAI image edits endpoint...")
-
-    start_time = time.time()
-    resp = requests.post(ENDPOINT, headers=headers, files=files, data=data, timeout=120)
-    elapsed = time.time() - start_time
-
-    if resp.status_code != 200:
-        raise HTTPException(status_code=resp.status_code, detail=f"Error from API: {resp.status_code}, {resp.text}")
-
-    j = resp.json()
-
-    # try base64 field first
-    image_data = j["data"][0].get("b64_json")
-    if image_data:
-        image_bytes = base64.b64decode(image_data)
-        return image_bytes
-
-    # fallback: URL
-    url = j["data"][0].get("url")
-    if url:
-        download = requests.get(url)
-        download.raise_for_status()
-        return download.content
-
-    raise HTTPException(status_code=500, detail="Unexpected response JSON from OpenAI API")
+    """Send image to Gemini API for editing/generation"""
+    if not gemini_client:
+        raise HTTPException(status_code=500, detail="Gemini client not initialized. Please check GEMINI_API_KEY.")
+    
+    logger.info(f"Sending request to Gemini API with model: {MODEL}")
+    
+    try:
+        start_time = time.time()
+        
+        # Generate content with Gemini API
+        response = gemini_client.models.generate_content(
+            model=MODEL,
+            contents=[
+                prompt,
+                image_data
+            ],
+            config=types.GenerateContentConfig(
+                response_modalities=['TEXT', 'IMAGE']
+            )
+        )
+        
+        elapsed = time.time() - start_time
+        logger.info(f"Gemini API response received in {elapsed:.2f} seconds")
+        
+        # Extract image from response
+        edited_image_bytes = None
+        for part in response.parts:
+            if part.text is not None:
+                logger.info(f"Gemini text response: {part.text}")
+            elif hasattr(part, 'as_image'):
+                try:
+                    image = part.as_image()
+                    # Convert PIL Image to bytes
+                    img_buffer = BytesIO()
+                    image.save(img_buffer, format='PNG')
+                    edited_image_bytes = img_buffer.getvalue()
+                    logger.info(f"✅ Image generated successfully ({len(edited_image_bytes)} bytes)")
+                    break
+                except Exception as e:
+                    logger.warning(f"Error extracting image from part: {e}")
+                    continue
+        
+        if not edited_image_bytes:
+            raise HTTPException(status_code=500, detail="No image was generated in the response from Gemini API")
+        
+        return edited_image_bytes
+        
+    except Exception as e:
+        logger.error(f"Error calling Gemini API: {e}")
+        raise HTTPException(status_code=500, detail=f"Error from Gemini API: {str(e)}")
 
 @app.get("/")
 async def root():
@@ -289,7 +305,9 @@ async def health_check():
     return {
         "status": "healthy",
         "timestamp": time.time(),
-        "api_key_configured": bool(API_KEY and API_KEY.startswith("sk-")),
+        "gemini_api_key_configured": bool(GEMINI_API_KEY),
+        "gemini_client_initialized": bool(gemini_client is not None),
+        "model": MODEL,
         "supabase_configured": bool(supabase is not None),
         "storage_bucket": STORAGE_BUCKET if supabase else None
     }
@@ -304,7 +322,7 @@ async def edit_image_endpoint(request: ImageRequest):
         logger.info(f"Downloading image from: {image_url_str}")
         image_data = download_image_from_url(image_url_str)
 
-        # Send the image to OpenAI API for editing
+        # Send the image to Gemini API for editing
         logger.info(f"Received prompt: {request.prompt}")
         edited_image = edit_image(image_data, request.prompt, image_url_str)
         
@@ -353,7 +371,7 @@ async def edit_image_stream_endpoint(request: ImageRequest):
         logger.info(f"Downloading image from: {image_url_str}")
         image_data = download_image_from_url(image_url_str)
 
-        # Send the image to OpenAI API for editing
+        # Send the image to Gemini API for editing
         logger.info(f"Received prompt: {request.prompt}")
         edited_image = edit_image(image_data, request.prompt, image_url_str)
         
