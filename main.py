@@ -155,6 +155,20 @@ def get_content_type_from_url(url):
     else:
         return "image/jpeg"  # default fallback
 
+def get_content_type_from_filename(filename):
+    """Determine content type based on filename extension"""
+    filename_lower = filename.lower()
+    if filename_lower.endswith(('.png', '.PNG')):
+        return "image/png"
+    elif filename_lower.endswith(('.jpg', '.jpeg', '.JPG', '.JPEG')):
+        return "image/jpeg"
+    elif filename_lower.endswith(('.gif', '.GIF')):
+        return "image/gif"
+    elif filename_lower.endswith(('.webp', '.WEBP')):
+        return "image/webp"
+    else:
+        return "image/png"  # default fallback (since edited images are PNG)
+
 def download_image_from_url(url):
     """Download image from URL and return image data"""
     try:
@@ -271,8 +285,11 @@ def upload_to_supabase(image_data: bytes, filename: str) -> dict:
 
         # Pass image_data directly as bytes to Supabase storage
 
+        # Determine content type from filename extension
+        content_type = get_content_type_from_filename(filename)
+        
         response = supabase.storage.from_(STORAGE_BUCKET).upload(filename, image_data, {
-            'content-type' : 'image/jpeg',
+            'content-type' : content_type,
             'upsert' : 'true'
         })
 
@@ -425,17 +442,13 @@ async def edit_image_endpoint(request: ImageRequest):
         logger.info(f"Received prompt: {request.prompt}")
         edited_image = edit_image(image_data, request.prompt, image_url_str)
         
-        # Optimize image to JPG format for smaller file size
-        logger.info("Optimizing image to JPG format...")
-        optimized_image = optimize_image_to_jpg(edited_image)
-        
         # Generate unique filename
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         unique_id = str(uuid.uuid4())[:8]
-        filename = f"edited_image_{timestamp}_{unique_id}.jpg"
+        filename = f"edited_image_{timestamp}_{unique_id}.png"
         
-        # Upload optimized image to Supabase storage
-        storage_result = upload_to_supabase(optimized_image, filename)
+        # Upload edited image to Supabase storage
+        storage_result = upload_to_supabase(edited_image, filename)
         
         if storage_result["uploaded"]:
             return ImageResponse(
@@ -474,14 +487,10 @@ async def edit_image_stream_endpoint(request: ImageRequest):
         logger.info(f"Received prompt: {request.prompt}")
         edited_image = edit_image(image_data, request.prompt, image_url_str)
         
-        # Optimize image to JPG format for smaller file size
-        logger.info("Optimizing image to JPG format...")
-        optimized_image = optimize_image_to_jpg(edited_image)
-        
         return StreamingResponse(
-            BytesIO(optimized_image), 
-            media_type="image/jpeg",
-            headers={"Content-Disposition": "attachment; filename=edited_image.jpg"}
+            BytesIO(edited_image), 
+            media_type="image/png",
+            headers={"Content-Disposition": "attachment; filename=edited_image.png"}
         )
     except HTTPException as e:
         logger.error(f"HTTP Exception: {e.detail}")
