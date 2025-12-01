@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 # === CONFIG ===
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
-MODEL = "nano-banana-pro"  # Using nano-banana-pro model as requested
+MODEL = "gemini-3-pro-image-preview"  # Using nano-banana-pro model as requested
 OUTPUT_FILE = "edited_image.png"
 
 # Configure Google Generative AI using the library

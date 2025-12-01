@@ -45,7 +45,7 @@ def setup_api_key(api_key: str = None):
 
 def generate_image(
     prompt: str,
-    model_name: str = "nano-banana-pro",
+    model_name: str = "gemini-3-pro-image-preview",
     output_path: str = None,
     input_image: Image.Image = None,
     input_image_path: str = None
