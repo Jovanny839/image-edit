@@ -4,9 +4,11 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, HttpUrl
 import os
+import base64
 import requests
 import time
 import uvicorn
+import re
 from io import BytesIO
 from fastapi.responses import StreamingResponse
 import logging
@@ -14,7 +16,9 @@ import uuid
 from datetime import datetime
 from supabase import create_client, Client
 from dotenv import load_dotenv
-from image_generator import ImageGenerator
+from PIL import Image
+import google.generativeai as genai
+from image_generator import setup_api_key, generate_image
 
 # Load environment variables
 load_dotenv()
@@ -25,17 +29,16 @@ logger = logging.getLogger(__name__)
 
 # === CONFIG ===
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
-MODEL = "gemini-3-pro-image-preview"
+MODEL = "nano-banana-pro"  # Using nano-banana-pro model as requested
 OUTPUT_FILE = "edited_image.png"
 
-# Initialize Image Generator
-image_generator: ImageGenerator = None
+# Configure Google Generative AI using the library
 if GOOGLE_API_KEY:
     try:
-        image_generator = ImageGenerator(api_key=GOOGLE_API_KEY, model_name=MODEL)
-        logger.info("✅ Image Generator initialized successfully")
+        setup_api_key(GOOGLE_API_KEY)
+        logger.info("✅ Google Generative AI configured successfully")
     except Exception as e:
-        logger.error(f"❌ Failed to initialize Image Generator: {e}")
+        logger.error(f"❌ Failed to configure Google Generative AI: {e}")
 else:
     logger.warning("⚠️ GOOGLE_API_KEY not found in environment variables")
 
@@ -216,21 +219,36 @@ def upload_to_supabase(image_data: bytes, filename: str) -> dict:
         return {"uploaded": False, "url": None, "message": f"Upload error: {e}"}
 
 def edit_image(image_data, prompt, image_url=None):
-    """Edit image using the ImageGenerator library"""
-    if not image_generator:
-        raise HTTPException(status_code=500, detail="Image Generator not configured. Please set GOOGLE_API_KEY environment variable.")
+    """Send image to Google Generative AI API for editing using nano-banana-pro model"""
+    if not GOOGLE_API_KEY:
+        raise HTTPException(status_code=500, detail="Google API key not configured")
     
     try:
-        # Use the image generator library to generate/edit the image
-        edited_image_bytes = image_generator.generate_image(image_data, prompt)
-        return edited_image_bytes
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except RuntimeError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # Create PIL Image from bytes for Google API
+        image = Image.open(BytesIO(image_data))
+        
+        logger.info(f"Sending request to Google Generative AI ({MODEL})...")
+        logger.info(f"Prompt: {prompt}")
+        start_time = time.time()
+        
+        # Use the image_generator library to generate the edited image
+        # The library handles the model initialization and response parsing
+        image_bytes = generate_image(
+            prompt=prompt,
+            model_name=MODEL,
+            input_image=image
+        )
+        
+        elapsed = time.time() - start_time
+        logger.info(f"Received response from Google API in {elapsed:.2f} seconds")
+        
+        return image_bytes
+        
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Unexpected error in edit_image: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+        logger.error(f"Error calling Google Generative AI: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error from Google API: {str(e)}")
 
 @app.get("/")
 async def root():
@@ -250,7 +268,6 @@ async def health_check():
         "timestamp": time.time(),
         "api_key_configured": bool(GOOGLE_API_KEY),
         "model": MODEL,
-        "image_generator_configured": bool(image_generator is not None),
         "supabase_configured": bool(supabase is not None),
         "storage_bucket": STORAGE_BUCKET if supabase else None
     }
