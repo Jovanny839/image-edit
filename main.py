@@ -8,7 +8,6 @@ import base64
 import requests
 import time
 import uvicorn
-import re
 from io import BytesIO
 from fastapi.responses import StreamingResponse
 import logging
@@ -16,9 +15,8 @@ import uuid
 from datetime import datetime
 from supabase import create_client, Client
 from dotenv import load_dotenv
+from io import BytesIO
 from PIL import Image
-import google.generativeai as genai
-from image_generator import setup_api_key, generate_image
 
 # Load environment variables
 load_dotenv()
@@ -28,19 +26,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # === CONFIG ===
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
-MODEL = "gemini-3-pro-image-preview"  # Using nano-banana-pro model as requested
+API_KEY = os.getenv("OPENAI_API_KEY", "")
+ENDPOINT = "https://api.openai.com/v1/images/edits"
+MODEL = "gpt-image-1"
 OUTPUT_FILE = "edited_image.png"
-
-# Configure Google Generative AI using the library
-if GOOGLE_API_KEY:
-    try:
-        setup_api_key(GOOGLE_API_KEY)
-        logger.info("✅ Google Generative AI configured successfully")
-    except Exception as e:
-        logger.error(f"❌ Failed to configure Google Generative AI: {e}")
-else:
-    logger.warning("⚠️ GOOGLE_API_KEY not found in environment variables")
 
 # Supabase Configuration
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -156,20 +145,6 @@ def get_content_type_from_url(url):
     else:
         return "image/jpeg"  # default fallback
 
-def get_content_type_from_filename(filename):
-    """Determine content type based on filename extension"""
-    filename_lower = filename.lower()
-    if filename_lower.endswith(('.png', '.PNG')):
-        return "image/png"
-    elif filename_lower.endswith(('.jpg', '.jpeg', '.JPG', '.JPEG')):
-        return "image/jpeg"
-    elif filename_lower.endswith(('.gif', '.GIF')):
-        return "image/gif"
-    elif filename_lower.endswith(('.webp', '.WEBP')):
-        return "image/webp"
-    else:
-        return "image/png"  # default fallback (since edited images are PNG)
-
 def download_image_from_url(url):
     """Download image from URL and return image data"""
     try:
@@ -178,6 +153,43 @@ def download_image_from_url(url):
         return response.content
     except requests.exceptions.RequestException as e:
         raise HTTPException(status_code=400, detail=f"Failed to download image from URL {url}: {e}")
+
+def optimize_image_to_jpg(image_data: bytes, quality: int = 85) -> bytes:
+    """Convert and optimize image to JPG format with compression while preserving original resolution"""
+    try:
+        # Open image from bytes
+        image = Image.open(BytesIO(image_data))
+        original_size_info = f"{image.width}x{image.height}"
+        
+        # Convert to RGB if necessary (PNG with transparency, etc.)
+        if image.mode in ('RGBA', 'LA', 'P'):
+            # Create white background for transparent images
+            background = Image.new('RGB', image.size, (255, 255, 255))
+            if image.mode == 'P':
+                image = image.convert('RGBA')
+            if image.mode in ('RGBA', 'LA'):
+                background.paste(image, mask=image.split()[-1])  # Use alpha channel as mask
+                image = background
+        elif image.mode != 'RGB':
+            image = image.convert('RGB')
+        
+        # Save as JPG with compression (keeping original resolution)
+        output_buffer = BytesIO()
+        image.save(output_buffer, format='JPEG', quality=quality, optimize=True)
+        optimized_data = output_buffer.getvalue()
+        
+        # Log compression results
+        original_size = len(image_data)
+        optimized_size = len(optimized_data)
+        compression_ratio = (1 - optimized_size / original_size) * 100
+        logger.info(f"Image optimized ({original_size_info}): {original_size:,} bytes → {optimized_size:,} bytes ({compression_ratio:.1f}% reduction)")
+        
+        return optimized_data
+        
+    except Exception as e:
+        logger.error(f"Error optimizing image: {e}")
+        # Return original data if optimization fails
+        return image_data
 
 def upload_to_supabase(image_data: bytes, filename: str) -> dict:
     """Upload image to Supabase storage and return the public URL"""
@@ -190,11 +202,8 @@ def upload_to_supabase(image_data: bytes, filename: str) -> dict:
 
         # Pass image_data directly as bytes to Supabase storage
 
-        # Determine content type from filename extension
-        content_type = get_content_type_from_filename(filename)
-        
         response = supabase.storage.from_(STORAGE_BUCKET).upload(filename, image_data, {
-            'content-type' : content_type,
+            'content-type' : 'image/jpeg',
             'upsert' : 'true'
         })
 
@@ -219,36 +228,50 @@ def upload_to_supabase(image_data: bytes, filename: str) -> dict:
         return {"uploaded": False, "url": None, "message": f"Upload error: {e}"}
 
 def edit_image(image_data, prompt, image_url=None):
-    """Send image to Google Generative AI API for editing using nano-banana-pro model"""
-    if not GOOGLE_API_KEY:
-        raise HTTPException(status_code=500, detail="Google API key not configured")
-    
-    try:
-        # Create PIL Image from bytes for Google API
-        image = Image.open(BytesIO(image_data))
-        
-        logger.info(f"Sending request to Google Generative AI ({MODEL})...")
-        logger.info(f"Prompt: {prompt}")
-        start_time = time.time()
-        
-        # Use the image_generator library to generate the edited image
-        # The library handles the model initialization and response parsing
-        image_bytes = generate_image(
-            prompt=prompt,
-            model_name=MODEL,
-            input_image=image
-        )
-        
-        elapsed = time.time() - start_time
-        logger.info(f"Received response from Google API in {elapsed:.2f} seconds")
-        
+    """Send image to OpenAI API for editing"""
+    headers = {"Authorization": f"Bearer {API_KEY}"}
+
+    # Prepare files for upload
+    # Determine content type from URL if provided, otherwise default to jpeg
+    if image_url:
+        image_content_type = get_content_type_from_url(image_url)
+    else:
+        image_content_type = "image/png"  # default fallback
+
+    files = {"image": ("image", image_data, image_content_type)}
+
+    data = {
+        "model": MODEL,
+        "prompt": prompt,
+        "n": "1",
+        "size": "auto"
+    }
+
+    print("Sending request to OpenAI image edits endpoint...")
+
+    start_time = time.time()
+    resp = requests.post(ENDPOINT, headers=headers, files=files, data=data, timeout=120)
+    elapsed = time.time() - start_time
+
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=f"Error from API: {resp.status_code}, {resp.text}")
+
+    j = resp.json()
+
+    # try base64 field first
+    image_data = j["data"][0].get("b64_json")
+    if image_data:
+        image_bytes = base64.b64decode(image_data)
         return image_bytes
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error calling Google Generative AI: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error from Google API: {str(e)}")
+
+    # fallback: URL
+    url = j["data"][0].get("url")
+    if url:
+        download = requests.get(url)
+        download.raise_for_status()
+        return download.content
+
+    raise HTTPException(status_code=500, detail="Unexpected response JSON from OpenAI API")
 
 @app.get("/")
 async def root():
@@ -266,8 +289,7 @@ async def health_check():
     return {
         "status": "healthy",
         "timestamp": time.time(),
-        "api_key_configured": bool(GOOGLE_API_KEY),
-        "model": MODEL,
+        "api_key_configured": bool(API_KEY and API_KEY.startswith("sk-")),
         "supabase_configured": bool(supabase is not None),
         "storage_bucket": STORAGE_BUCKET if supabase else None
     }
@@ -282,17 +304,21 @@ async def edit_image_endpoint(request: ImageRequest):
         logger.info(f"Downloading image from: {image_url_str}")
         image_data = download_image_from_url(image_url_str)
 
-        # Send the image to Google Generative AI API for editing
+        # Send the image to OpenAI API for editing
         logger.info(f"Received prompt: {request.prompt}")
         edited_image = edit_image(image_data, request.prompt, image_url_str)
+        
+        # Optimize image to JPG format for smaller file size
+        logger.info("Optimizing image to JPG format...")
+        optimized_image = optimize_image_to_jpg(edited_image)
         
         # Generate unique filename
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         unique_id = str(uuid.uuid4())[:8]
-        filename = f"edited_image_{timestamp}_{unique_id}.png"
+        filename = f"edited_image_{timestamp}_{unique_id}.jpg"
         
-        # Upload edited image to Supabase storage
-        storage_result = upload_to_supabase(edited_image, filename)
+        # Upload optimized image to Supabase storage
+        storage_result = upload_to_supabase(optimized_image, filename)
         
         if storage_result["uploaded"]:
             return ImageResponse(
@@ -327,14 +353,18 @@ async def edit_image_stream_endpoint(request: ImageRequest):
         logger.info(f"Downloading image from: {image_url_str}")
         image_data = download_image_from_url(image_url_str)
 
-        # Send the image to Google Generative AI API for editing
+        # Send the image to OpenAI API for editing
         logger.info(f"Received prompt: {request.prompt}")
         edited_image = edit_image(image_data, request.prompt, image_url_str)
         
+        # Optimize image to JPG format for smaller file size
+        logger.info("Optimizing image to JPG format...")
+        optimized_image = optimize_image_to_jpg(edited_image)
+        
         return StreamingResponse(
-            BytesIO(edited_image), 
-            media_type="image/png",
-            headers={"Content-Disposition": "attachment; filename=edited_image.png"}
+            BytesIO(optimized_image), 
+            media_type="image/jpeg",
+            headers={"Content-Disposition": "attachment; filename=edited_image.jpg"}
         )
     except HTTPException as e:
         logger.error(f"HTTP Exception: {e.detail}")
