@@ -18,6 +18,7 @@ from io import BytesIO
 from PIL import Image
 from google import genai
 from google.genai import types
+from google.genai.types import Image
 
 
 # Load environment variables
@@ -252,7 +253,7 @@ def edit_image(image_data, prompt, image_url=None):
             model=MODEL,
             contents=[
                 prompt,
-                image_data
+                Image.from_bytes(image_data, mime_type="image/png")
             ],
             config=types.GenerateContentConfig(
                 response_modalities=['TEXT', 'IMAGE']
