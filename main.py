@@ -5,6 +5,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, HttpUrl
 import os
 import requests
+import base64
 import time
 import uvicorn
 from io import BytesIO
@@ -156,6 +157,24 @@ def get_content_type_from_url(url):
     else:
         return "image/jpeg"  # default fallback
 
+def detect_image_mime_type(image_data: bytes) -> str:
+    """Detect MIME type from image bytes using PIL"""
+    try:
+        image = Image.open(BytesIO(image_data))
+        format_to_mime = {
+            'PNG': 'image/png',
+            'JPEG': 'image/jpeg',
+            'JPG': 'image/jpeg',
+            'GIF': 'image/gif',
+            'WEBP': 'image/webp',
+            'BMP': 'image/bmp',
+            'TIFF': 'image/tiff'
+        }
+        return format_to_mime.get(image.format, 'image/jpeg')
+    except Exception as e:
+        logger.warning(f"Could not detect image format, defaulting to image/jpeg: {e}")
+        return "image/jpeg"
+
 def download_image_from_url(url):
     """Download image from URL and return image data"""
     try:
@@ -248,12 +267,23 @@ def edit_image(image_data, prompt, image_url=None):
     try:
         start_time = time.time()
         
-        # Generate content with Gemini API
+        # Detect MIME type from image data
+        mime_type = detect_image_mime_type(image_data)
+        logger.info(f"Detected image MIME type: {mime_type}")
+        
+        # Encode image to base64
+        image_base64 = base64.b64encode(image_data).decode('utf-8')
+        
+        # Generate content with Gemini API using dictionary format
         response = gemini_client.models.generate_content(
             model=MODEL,
             contents=[
-                prompt,
-                Image.from_bytes(image_data, mime_type="image/png")
+                {
+                    "parts": [
+                        {"text": prompt},
+                        {"image": {"mime_type": mime_type, "data": image_base64}}
+                    ]
+                }
             ],
             config=types.GenerateContentConfig(
                 response_modalities=['TEXT', 'IMAGE']
