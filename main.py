@@ -274,14 +274,21 @@ def edit_image(image_data, prompt, image_url=None):
         # Encode image to base64
         image_base64 = base64.b64encode(image_data).decode('utf-8')
         
-        # Generate content with Gemini API using dictionary format
+        # Generate content with Gemini API using the expected dictionary format
+        # The API expects contents to be a list with role and parts
         response = gemini_client.models.generate_content(
             model=MODEL,
             contents=[
                 {
+                    "role": "user",
                     "parts": [
                         {"text": prompt},
-                        {"image": {"mime_type": mime_type, "data": image_base64}}
+                        {
+                            "inline_data": {
+                                "mime_type": mime_type,
+                                "data": image_base64
+                            }
+                        }
                     ]
                 }
             ],
