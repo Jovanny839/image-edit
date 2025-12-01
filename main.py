@@ -16,10 +16,10 @@ from datetime import datetime
 from supabase import create_client, Client
 from dotenv import load_dotenv
 from io import BytesIO
-from PIL import Image
+from PIL import Image as PILImage
 from google import genai
 from google.genai import types
-from google.genai.types import Image
+from google.genai.types import Image as GeminiImage
 
 
 # Load environment variables
@@ -160,7 +160,7 @@ def get_content_type_from_url(url):
 def detect_image_mime_type(image_data: bytes) -> str:
     """Detect MIME type from image bytes using PIL"""
     try:
-        image = Image.open(BytesIO(image_data))
+        image = PILImage.open(BytesIO(image_data))
         format_to_mime = {
             'PNG': 'image/png',
             'JPEG': 'image/jpeg',
@@ -188,13 +188,13 @@ def optimize_image_to_jpg(image_data: bytes, quality: int = 85) -> bytes:
     """Convert and optimize image to JPG format with compression while preserving original resolution"""
     try:
         # Open image from bytes
-        image = Image.open(BytesIO(image_data))
+        image = PILImage.open(BytesIO(image_data))
         original_size_info = f"{image.width}x{image.height}"
         
         # Convert to RGB if necessary (PNG with transparency, etc.)
         if image.mode in ('RGBA', 'LA', 'P'):
             # Create white background for transparent images
-            background = Image.new('RGB', image.size, (255, 255, 255))
+            background = PILImage.new('RGB', image.size, (255, 255, 255))
             if image.mode == 'P':
                 image = image.convert('RGBA')
             if image.mode in ('RGBA', 'LA'):
@@ -271,7 +271,10 @@ def edit_image(image_data, prompt, image_url=None):
         mime_type = detect_image_mime_type(image_data)
         logger.info(f"Detected image MIME type: {mime_type}")
         
-        # Encode image to base64
+        # Create Gemini Image object from bytes
+        gemini_input_image = GeminiImage.from_bytes(image_data, mime_type=mime_type)
+        
+        # Encode image to base64 for the dictionary format
         image_base64 = base64.b64encode(image_data).decode('utf-8')
         
         # Generate content with Gemini API using the expected dictionary format
@@ -305,20 +308,70 @@ def edit_image(image_data, prompt, image_url=None):
         for part in response.parts:
             if part.text is not None:
                 logger.info(f"Gemini text response: {part.text}")
+            elif hasattr(part, 'inline_data'):
+                # Check if part has inline_data (image data)
+                try:
+                    inline_data = part.inline_data
+                    if inline_data and hasattr(inline_data, 'data'):
+                        # Decode base64 image data
+                        edited_image_bytes = base64.b64decode(inline_data.data)
+                        logger.info(f"✅ Image extracted from inline_data ({len(edited_image_bytes)} bytes)")
+                        break
+                except Exception as e:
+                    logger.warning(f"Error extracting from inline_data: {e}")
             elif hasattr(part, 'as_image'):
                 try:
-                    image = part.as_image()
-                    # Convert PIL Image to bytes
-                    img_buffer = BytesIO()
-                    image.save(img_buffer, format='PNG')
-                    edited_image_bytes = img_buffer.getvalue()
-                    logger.info(f"✅ Image generated successfully ({len(edited_image_bytes)} bytes)")
-                    break
+                    gemini_image = part.as_image()
+                    logger.info(f"Got Gemini Image object: {type(gemini_image)}")
+                    
+                    # The Gemini Image object should have a way to get bytes
+                    # Try different methods to extract bytes
+                    if hasattr(gemini_image, 'to_bytes'):
+                        edited_image_bytes = gemini_image.to_bytes()
+                    elif hasattr(gemini_image, 'bytes'):
+                        edited_image_bytes = gemini_image.bytes
+                    elif hasattr(gemini_image, 'data'):
+                        data = gemini_image.data
+                        if isinstance(data, bytes):
+                            edited_image_bytes = data
+                        elif isinstance(data, str):
+                            edited_image_bytes = base64.b64decode(data)
+                    else:
+                        # Try to convert to PIL Image and then to bytes
+                        # Check if we can access the image bytes through the Gemini Image API
+                        # Some SDKs return PIL Image directly from as_image()
+                        if isinstance(gemini_image, PILImage.Image):
+                            # It's already a PIL Image
+                            img_buffer = BytesIO()
+                            gemini_image.save(img_buffer, format='PNG')
+                            edited_image_bytes = img_buffer.getvalue()
+                        else:
+                            # Log available attributes for debugging
+                            attrs = [a for a in dir(gemini_image) if not a.startswith('_')]
+                            logger.warning(f"Gemini Image object attributes: {attrs}")
+                            # Try accessing mime_type and data if they exist
+                            if hasattr(gemini_image, 'mime_type') and hasattr(gemini_image, 'data'):
+                                if isinstance(gemini_image.data, bytes):
+                                    edited_image_bytes = gemini_image.data
+                                elif isinstance(gemini_image.data, str):
+                                    edited_image_bytes = base64.b64decode(gemini_image.data)
+                    
+                    if edited_image_bytes:
+                        logger.info(f"✅ Image generated successfully ({len(edited_image_bytes)} bytes)")
+                        break
                 except Exception as e:
                     logger.warning(f"Error extracting image from part: {e}")
+                    import traceback
+                    logger.debug(f"Traceback: {traceback.format_exc()}")
                     continue
         
         if not edited_image_bytes:
+            # Log more details for debugging
+            logger.error(f"No image found in response. Response has {len(response.parts)} parts")
+            for i, part in enumerate(response.parts):
+                part_type = type(part).__name__
+                attrs = [a for a in dir(part) if not a.startswith('_')]
+                logger.error(f"Part {i}: type={part_type}, attributes={attrs}")
             raise HTTPException(status_code=500, detail="No image was generated in the response from Gemini API")
         
         return edited_image_bytes
