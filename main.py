@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 # === CONFIG ===
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
-MODEL = "gemini-3-pro-preview"
+MODEL = "gemini-3-pro-image-preview"
 OUTPUT_FILE = "edited_image.png"
 
 # Configure Google Generative AI
