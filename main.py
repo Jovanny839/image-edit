@@ -8,6 +8,7 @@ import base64
 import requests
 import time
 import uvicorn
+import re
 from io import BytesIO
 from fastapi.responses import StreamingResponse
 import logging
@@ -15,8 +16,8 @@ import uuid
 from datetime import datetime
 from supabase import create_client, Client
 from dotenv import load_dotenv
-from io import BytesIO
 from PIL import Image
+import google.generativeai as genai
 
 # Load environment variables
 load_dotenv()
@@ -26,10 +27,19 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # === CONFIG ===
-API_KEY = os.getenv("OPENAI_API_KEY", "")
-ENDPOINT = "https://api.openai.com/v1/images/edits"
-MODEL = "gpt-image-1"
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+MODEL = "gemini-3-pro-preview"
 OUTPUT_FILE = "edited_image.png"
+
+# Configure Google Generative AI
+if GOOGLE_API_KEY:
+    try:
+        genai.configure(api_key=GOOGLE_API_KEY)
+        logger.info("✅ Google Generative AI configured successfully")
+    except Exception as e:
+        logger.error(f"❌ Failed to configure Google Generative AI: {e}")
+else:
+    logger.warning("⚠️ GOOGLE_API_KEY not found in environment variables")
 
 # Supabase Configuration
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -228,50 +238,91 @@ def upload_to_supabase(image_data: bytes, filename: str) -> dict:
         return {"uploaded": False, "url": None, "message": f"Upload error: {e}"}
 
 def edit_image(image_data, prompt, image_url=None):
-    """Send image to OpenAI API for editing"""
-    headers = {"Authorization": f"Bearer {API_KEY}"}
-
-    # Prepare files for upload
-    # Determine content type from URL if provided, otherwise default to jpeg
-    if image_url:
-        image_content_type = get_content_type_from_url(image_url)
-    else:
-        image_content_type = "image/png"  # default fallback
-
-    files = {"image": ("image", image_data, image_content_type)}
-
-    data = {
-        "model": MODEL,
-        "prompt": prompt,
-        "n": "1",
-        "size": "auto"
-    }
-
-    print("Sending request to OpenAI image edits endpoint...")
-
-    start_time = time.time()
-    resp = requests.post(ENDPOINT, headers=headers, files=files, data=data, timeout=120)
-    elapsed = time.time() - start_time
-
-    if resp.status_code != 200:
-        raise HTTPException(status_code=resp.status_code, detail=f"Error from API: {resp.status_code}, {resp.text}")
-
-    j = resp.json()
-
-    # try base64 field first
-    image_data = j["data"][0].get("b64_json")
-    if image_data:
-        image_bytes = base64.b64decode(image_data)
-        return image_bytes
-
-    # fallback: URL
-    url = j["data"][0].get("url")
-    if url:
-        download = requests.get(url)
-        download.raise_for_status()
-        return download.content
-
-    raise HTTPException(status_code=500, detail="Unexpected response JSON from OpenAI API")
+    """Send image to Google Generative AI API for editing using nano-banana-pro model"""
+    if not GOOGLE_API_KEY:
+        raise HTTPException(status_code=500, detail="Google API key not configured")
+    
+    try:
+        # Initialize the model
+        model = genai.GenerativeModel(MODEL)
+        
+        # Create PIL Image from bytes for Google API
+        image = Image.open(BytesIO(image_data))
+        
+        # Prepare the prompt with image editing instruction
+        full_prompt = f"Edit this image according to the following instruction: {prompt}. Generate and return the edited image."
+        
+        logger.info(f"Sending request to Google Generative AI ({MODEL})...")
+        start_time = time.time()
+        
+        # Generate content with image and prompt
+        # For image editing, we pass both the image and the prompt
+        response = model.generate_content([image, full_prompt])
+        elapsed = time.time() - start_time
+        logger.info(f"Received response from Google API in {elapsed:.2f} seconds")
+        
+        # Handle different response formats from Google API
+        # Check if response has candidates with content
+        if hasattr(response, 'candidates') and response.candidates:
+            candidate = response.candidates[0]
+            if hasattr(candidate, 'content') and hasattr(candidate.content, 'parts'):
+                for part in candidate.content.parts:
+                    # Check for inline data (base64 encoded image)
+                    if hasattr(part, 'inline_data') and part.inline_data:
+                        if hasattr(part.inline_data, 'data'):
+                            image_bytes = base64.b64decode(part.inline_data.data)
+                            return image_bytes
+                    # Check for image object
+                    if hasattr(part, 'image') and part.image:
+                        image_buffer = BytesIO()
+                        part.image.save(image_buffer, format='PNG')
+                        return image_buffer.getvalue()
+        
+        # Check if response has parts directly
+        if hasattr(response, 'parts') and response.parts:
+            for part in response.parts:
+                if hasattr(part, 'inline_data') and part.inline_data:
+                    if hasattr(part.inline_data, 'data'):
+                        image_bytes = base64.b64decode(part.inline_data.data)
+                        return image_bytes
+                if hasattr(part, 'image') and part.image:
+                    image_buffer = BytesIO()
+                    part.image.save(image_buffer, format='PNG')
+                    return image_buffer.getvalue()
+        
+        # Check if response has images attribute
+        if hasattr(response, 'images') and response.images:
+            generated_image = response.images[0]
+            image_buffer = BytesIO()
+            if isinstance(generated_image, Image.Image):
+                generated_image.save(image_buffer, format='PNG')
+            else:
+                # If it's already bytes or other format
+                return generated_image if isinstance(generated_image, bytes) else str(generated_image).encode()
+            return image_buffer.getvalue()
+        
+        # If response contains text, try to extract base64 image data
+        if hasattr(response, 'text') and response.text:
+            # Try to find base64 image data in the text
+            base64_match = re.search(r'data:image/[^;]+;base64,([A-Za-z0-9+/=]+)', response.text)
+            if base64_match:
+                image_bytes = base64.b64decode(base64_match.group(1))
+                return image_bytes
+            # Log the text response for debugging
+            logger.warning(f"API returned text instead of image: {response.text[:200]}")
+        
+        # If we can't find an image, log the full response structure for debugging
+        logger.error(f"Could not extract image from response. Response type: {type(response)}, Attributes: {dir(response)}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Unexpected response from Google API. Could not extract image from response. Response type: {type(response)}"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error calling Google Generative AI: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error from Google API: {str(e)}")
 
 @app.get("/")
 async def root():
@@ -289,7 +340,8 @@ async def health_check():
     return {
         "status": "healthy",
         "timestamp": time.time(),
-        "api_key_configured": bool(API_KEY and API_KEY.startswith("sk-")),
+        "api_key_configured": bool(GOOGLE_API_KEY),
+        "model": MODEL,
         "supabase_configured": bool(supabase is not None),
         "storage_bucket": STORAGE_BUCKET if supabase else None
     }
@@ -304,7 +356,7 @@ async def edit_image_endpoint(request: ImageRequest):
         logger.info(f"Downloading image from: {image_url_str}")
         image_data = download_image_from_url(image_url_str)
 
-        # Send the image to OpenAI API for editing
+        # Send the image to Google Generative AI API for editing
         logger.info(f"Received prompt: {request.prompt}")
         edited_image = edit_image(image_data, request.prompt, image_url_str)
         
@@ -353,7 +405,7 @@ async def edit_image_stream_endpoint(request: ImageRequest):
         logger.info(f"Downloading image from: {image_url_str}")
         image_data = download_image_from_url(image_url_str)
 
-        # Send the image to OpenAI API for editing
+        # Send the image to Google Generative AI API for editing
         logger.info(f"Received prompt: {request.prompt}")
         edited_image = edit_image(image_data, request.prompt, image_url_str)
         
