@@ -164,11 +164,50 @@ def download_image_from_url(url):
     except requests.exceptions.RequestException as e:
         raise HTTPException(status_code=400, detail=f"Failed to download image from URL {url}: {e}")
 
-def optimize_image_to_jpg(image_data: bytes, quality: int = 85) -> bytes:
+def optimize_image_to_jpg(image_data, quality: int = 85) -> bytes:
     """Convert and optimize image to JPG format with compression while preserving original resolution"""
     try:
-        # Open image from bytes
-        image = Image.open(BytesIO(image_data))
+        # Handle both bytes and BytesIO objects
+        if isinstance(image_data, BytesIO):
+            # Reset position to beginning if it's a BytesIO object
+            image_data.seek(0)
+            image_bytes = image_data.read()
+            image_data.seek(0)  # Reset again for potential reuse
+        elif isinstance(image_data, bytes):
+            image_bytes = image_data
+        else:
+            # Try to convert to bytes if it's something else
+            logger.warning(f"Unexpected image_data type: {type(image_data)}, attempting to convert to bytes")
+            if hasattr(image_data, 'read'):
+                # It's a file-like object
+                image_data.seek(0) if hasattr(image_data, 'seek') else None
+                image_bytes = image_data.read()
+            else:
+                image_bytes = bytes(image_data)
+        
+        # Validate that we have image data
+        if not image_bytes or len(image_bytes) == 0:
+            raise ValueError("Empty image data provided")
+        
+        # Validate minimum size for a valid image (very small files are likely invalid)
+        if len(image_bytes) < 100:
+            logger.warning(f"Image data is very small ({len(image_bytes)} bytes), may be invalid")
+        
+        # Create BytesIO object for PIL, ensuring position is at 0
+        image_buffer = BytesIO(image_bytes)
+        image_buffer.seek(0)
+        
+        # Open image from bytes - PIL will identify the format automatically
+        try:
+            image = Image.open(image_buffer)
+        except Exception as img_error:
+            # If PIL can't identify the format, log details and re-raise
+            logger.error(f"PIL could not identify image format. Data size: {len(image_bytes)} bytes")
+            logger.error(f"First 100 bytes (hex): {image_bytes[:100].hex()}")
+            logger.error(f"First 100 bytes (ascii): {repr(image_bytes[:100])}")
+            raise ValueError(f"Cannot identify image format: {str(img_error)}") from img_error
+        
+        # Get image info before any operations
         original_size_info = f"{image.width}x{image.height}"
         
         # Convert to RGB if necessary (PNG with transparency, etc.)
@@ -189,7 +228,7 @@ def optimize_image_to_jpg(image_data: bytes, quality: int = 85) -> bytes:
         optimized_data = output_buffer.getvalue()
         
         # Log compression results
-        original_size = len(image_data)
+        original_size = len(image_bytes)
         optimized_size = len(optimized_data)
         compression_ratio = (1 - optimized_size / original_size) * 100
         logger.info(f"Image optimized ({original_size_info}): {original_size:,} bytes → {optimized_size:,} bytes ({compression_ratio:.1f}% reduction)")
@@ -197,9 +236,29 @@ def optimize_image_to_jpg(image_data: bytes, quality: int = 85) -> bytes:
         return optimized_data
         
     except Exception as e:
-        logger.error(f"Error optimizing image: {e}")
+        logger.error(f"Error optimizing image: {e}", exc_info=True)
+        # Log more details about the image data for debugging
+        try:
+            if isinstance(image_data, BytesIO):
+                image_data.seek(0)
+                data_preview = image_data.read(100)
+                image_data.seek(0)
+                logger.error(f"Image data type: BytesIO, preview (first 100 bytes hex): {data_preview.hex()[:200]}")
+            elif isinstance(image_data, bytes):
+                logger.error(f"Image data type: bytes, size: {len(image_data)} bytes, preview (first 100 bytes hex): {image_data[:100].hex()[:200]}")
+            else:
+                logger.error(f"Image data type: {type(image_data)}")
+        except Exception as log_error:
+            logger.error(f"Could not log image data details: {log_error}")
+        
         # Return original data if optimization fails
-        return image_data
+        if isinstance(image_data, bytes):
+            return image_data
+        elif isinstance(image_data, BytesIO):
+            image_data.seek(0)
+            return image_data.read()
+        else:
+            raise HTTPException(status_code=500, detail=f"Failed to optimize image: {str(e)}")
 
 def upload_to_supabase(image_data: bytes, filename: str) -> dict:
     """Upload image to Supabase storage and return the public URL"""
@@ -276,6 +335,7 @@ def edit_image(image_data, prompt, image_url=None):
                     if hasattr(part, 'image') and part.image:
                         image_buffer = BytesIO()
                         part.image.save(image_buffer, format='PNG')
+                        image_buffer.seek(0)  # Reset position before getting value
                         return image_buffer.getvalue()
         
         # Check if response has parts directly
@@ -288,6 +348,7 @@ def edit_image(image_data, prompt, image_url=None):
                 if hasattr(part, 'image') and part.image:
                     image_buffer = BytesIO()
                     part.image.save(image_buffer, format='PNG')
+                    image_buffer.seek(0)  # Reset position before getting value
                     return image_buffer.getvalue()
         
         # Check if response has images attribute
@@ -296,10 +357,14 @@ def edit_image(image_data, prompt, image_url=None):
             image_buffer = BytesIO()
             if isinstance(generated_image, Image.Image):
                 generated_image.save(image_buffer, format='PNG')
+                image_buffer.seek(0)  # Reset position before getting value
+                return image_buffer.getvalue()
+            elif isinstance(generated_image, bytes):
+                return generated_image
             else:
-                # If it's already bytes or other format
-                return generated_image if isinstance(generated_image, bytes) else str(generated_image).encode()
-            return image_buffer.getvalue()
+                # If it's not bytes or Image, log warning and try to convert
+                logger.warning(f"Unexpected image type from response.images: {type(generated_image)}")
+                raise ValueError(f"Unsupported image format in response: {type(generated_image)}")
         
         # If response contains text, try to extract base64 image data
         if hasattr(response, 'text') and response.text:
