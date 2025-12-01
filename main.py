@@ -271,9 +271,6 @@ def edit_image(image_data, prompt, image_url=None):
         mime_type = detect_image_mime_type(image_data)
         logger.info(f"Detected image MIME type: {mime_type}")
         
-        # Create Gemini Image object from bytes
-        gemini_input_image = GeminiImage.from_bytes(image_data, mime_type=mime_type)
-        
         # Encode image to base64 for the dictionary format
         image_base64 = base64.b64encode(image_data).decode('utf-8')
         
