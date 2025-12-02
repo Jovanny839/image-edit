@@ -20,9 +20,17 @@ from PIL import Image as PILImage
 from google import genai
 from google.genai import types
 from google.genai.types import Image as GeminiImage
-from lib.story_lib import generate_story
+# from lib.story_lib import generate_story
 from typing import List, Optional
 
+try:
+    from lib.story_lib import generate_story
+except ImportError:
+    # Fallback for deployment environments where lib might be at root
+    import sys
+    import os
+    sys.path.insert(0, os.path.dirname(__file__))
+    from story_lib import generate_story
 
 # Load environment variables
 load_dotenv()
