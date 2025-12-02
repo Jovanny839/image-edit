@@ -301,13 +301,54 @@ def edit_image(image_data, prompt, image_url=None):
         logger.info(f"Gemini API response received in {elapsed:.2f} seconds")
         
         # Extract image from response
-        # Try as_image() first as it's often more reliable
+        # Prioritize inline_data as it's the most direct source of image bytes
         edited_image_bytes = None
         for part in response.parts:
             if part.text is not None:
                 logger.info(f"Gemini text response: {part.text}")
-            elif hasattr(part, 'as_image'):
-                # Try as_image() first - this is often the most reliable method
+            
+            # Check inline_data first - this is the most reliable source
+            if hasattr(part, 'inline_data'):
+                try:
+                    inline_data = part.inline_data
+                    logger.info(f"Found inline_data, type: {type(inline_data)}")
+                    
+                    # Try to get data from inline_data
+                    if inline_data and hasattr(inline_data, 'data'):
+                        data = inline_data.data
+                        if isinstance(data, bytes):
+                            edited_image_bytes = data
+                            logger.info(f"✅ Image extracted from inline_data.data (bytes) ({len(edited_image_bytes)} bytes)")
+                        elif isinstance(data, str):
+                            # Try to decode base64
+                            try:
+                                edited_image_bytes = base64.b64decode(data)
+                                logger.info(f"✅ Image extracted from inline_data.data (base64) ({len(edited_image_bytes)} bytes)")
+                            except Exception as e:
+                                logger.warning(f"Failed to decode base64 data: {e}")
+                                # If it's not base64, try encoding as latin-1 (unlikely but possible)
+                                edited_image_bytes = data.encode('latin-1')
+                                logger.info(f"✅ Image extracted from inline_data.data (string) ({len(edited_image_bytes)} bytes)")
+                    elif inline_data and hasattr(inline_data, 'bytes'):
+                        edited_image_bytes = inline_data.bytes
+                        logger.info(f"✅ Image extracted from inline_data.bytes ({len(edited_image_bytes)} bytes)")
+                    
+                    # Validate the extracted data
+                    if edited_image_bytes and len(edited_image_bytes) > 1000:
+                        logger.info(f"✅ Valid image extracted from inline_data ({len(edited_image_bytes)} bytes)")
+                        break
+                    elif edited_image_bytes:
+                        logger.warning(f"Extracted data from inline_data is suspiciously small ({len(edited_image_bytes)} bytes), trying other methods...")
+                        edited_image_bytes = None  # Reset to try other methods
+                    else:
+                        logger.warning(f"inline_data exists but no valid data found. inline_data attributes: {[a for a in dir(inline_data) if not a.startswith('_')]}")
+                except Exception as e:
+                    logger.warning(f"Error extracting from inline_data: {e}")
+                    import traceback
+                    logger.debug(f"Traceback: {traceback.format_exc()}")
+            
+            # Fallback to as_image() if inline_data didn't work
+            if not edited_image_bytes and hasattr(part, 'as_image'):
                 try:
                     gemini_image = part.as_image()
                     logger.info(f"Got Gemini Image object: {type(gemini_image)}")
@@ -350,45 +391,6 @@ def edit_image(image_data, prompt, image_url=None):
                         edited_image_bytes = None  # Reset to try other methods
                 except Exception as e:
                     logger.warning(f"Error extracting from as_image(): {e}")
-                    import traceback
-                    logger.debug(f"Traceback: {traceback.format_exc()}")
-            elif hasattr(part, 'inline_data'):
-                # Check if part has inline_data (image data)
-                try:
-                    inline_data = part.inline_data
-                    logger.info(f"Inline data type: {type(inline_data)}, attributes: {[a for a in dir(inline_data) if not a.startswith('_')]}")
-                    
-                    if inline_data:
-                        # Try different ways to access the data
-                        if hasattr(inline_data, 'data'):
-                            data = inline_data.data
-                            if isinstance(data, bytes):
-                                edited_image_bytes = data
-                            elif isinstance(data, str):
-                                # Try to decode base64
-                                try:
-                                    edited_image_bytes = base64.b64decode(data)
-                                except Exception:
-                                    # If it's not base64, it might already be decoded
-                                    edited_image_bytes = data.encode('latin-1') if isinstance(data, str) else data
-                        elif hasattr(inline_data, 'mime_type'):
-                            logger.info(f"Found inline_data with mime_type: {inline_data.mime_type}")
-                            # Check for other attributes
-                            if hasattr(inline_data, 'bytes'):
-                                edited_image_bytes = inline_data.bytes
-                        
-                        # Validate the extracted data
-                        if edited_image_bytes:
-                            if len(edited_image_bytes) < 1000:
-                                logger.warning(f"Extracted data from inline_data is suspiciously small ({len(edited_image_bytes)} bytes). This might not be a valid image.")
-                                # Log first few bytes for debugging
-                                logger.debug(f"First 100 bytes: {edited_image_bytes[:100]}")
-                                edited_image_bytes = None  # Don't use invalid data
-                            else:
-                                logger.info(f"✅ Image extracted from inline_data ({len(edited_image_bytes)} bytes)")
-                                break
-                except Exception as e:
-                    logger.warning(f"Error extracting from inline_data: {e}")
                     import traceback
                     logger.debug(f"Traceback: {traceback.format_exc()}")
         
