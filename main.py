@@ -20,6 +20,8 @@ from PIL import Image as PILImage
 from google import genai
 from google.genai import types
 from google.genai.types import Image as GeminiImage
+from lib.story_lib import generate_story
+from typing import List, Optional
 
 
 # Load environment variables
@@ -140,6 +142,54 @@ class ImageResponse(BaseModel):
                     "filename": "edited_image_123.jpg",
                     "bucket": "images"
                 }
+            }
+        }
+
+# Request model for story generation
+class StoryRequest(BaseModel):
+    character_name: str
+    character_type: str
+    special_ability: str
+    age_group: str  # Must be "3-6", "7-10", or "11-12"
+    story_world: str
+    adventure_type: str
+    occasion_theme: Optional[str] = None
+    
+    class Config:
+        schema_extra = {
+            "example": {
+                "character_name": "Luna",
+                "character_type": "a brave dragon",
+                "special_ability": "fly through clouds",
+                "age_group": "7-10",
+                "story_world": "the Enchanted Forest",
+                "adventure_type": "treasure hunt",
+                "occasion_theme": None
+            }
+        }
+
+# Response model for story generation
+class StoryResponse(BaseModel):
+    success: bool
+    pages: List[str]
+    full_story: str
+    word_count: int
+    page_word_counts: List[int]
+    
+    class Config:
+        schema_extra = {
+            "example": {
+                "success": True,
+                "pages": [
+                    "Meet Luna, a brave dragon who loves adventures. Luna has a special power: Luna can fly through clouds.",
+                    "While exploring, Luna discovered a magical entrance that led to the Enchanted Forest.",
+                    "Suddenly, Luna realized that a treasure hunt was beginning, and Luna was right in the middle of it.",
+                    "When the moment of truth arrived, Luna faced the challenge head-on, even though it seemed impossible at first.",
+                    "The adventure came to a wonderful conclusion, and Luna felt proud of what had been accomplished."
+                ],
+                "full_story": "Meet Luna, a brave dragon who loves adventures...",
+                "word_count": 250,
+                "page_word_counts": [20, 25, 30, 28, 27]
             }
         }
 
@@ -522,6 +572,53 @@ async def edit_image_stream_endpoint(request: ImageRequest):
         raise e
     except Exception as e:
         logger.error(f"Unexpected error in edit_image_stream_endpoint: {e}")
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
+
+@app.post("/generate-story/", response_model=StoryResponse)
+async def generate_story_endpoint(request: StoryRequest):
+    """Generate a 5-page children's story based on the provided parameters"""
+    try:
+        # Validate age_group
+        valid_age_groups = ["3-6", "7-10", "11-12"]
+        if request.age_group not in valid_age_groups:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid age_group: {request.age_group}. Must be one of: {', '.join(valid_age_groups)}"
+            )
+        
+        logger.info(f"Generating story for character: {request.character_name}")
+        logger.info(f"Age group: {request.age_group}, Adventure: {request.adventure_type}")
+        
+        # Generate the story using the story library
+        story_result = generate_story(
+            character_name=request.character_name,
+            character_type=request.character_type,
+            special_ability=request.special_ability,
+            age_group=request.age_group,
+            story_world=request.story_world,
+            adventure_type=request.adventure_type,
+            occasion_theme=request.occasion_theme,
+            use_api=False  # Use template-based generation
+        )
+        
+        logger.info(f"Story generated successfully. Word count: {story_result['word_count']}")
+        
+        return StoryResponse(
+            success=True,
+            pages=story_result['pages'],
+            full_story=story_result['full_story'],
+            word_count=story_result['word_count'],
+            page_word_counts=story_result['page_word_counts']
+        )
+        
+    except ValueError as e:
+        logger.error(f"Validation error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException as e:
+        logger.error(f"HTTP Exception: {e.detail}")
+        raise e
+    except Exception as e:
+        logger.error(f"Unexpected error in generate_story_endpoint: {e}")
         raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
 
 if __name__ == "__main__":
