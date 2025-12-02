@@ -1,9 +1,18 @@
+import os
+import sys
+from pathlib import Path
+
+# Add current directory to Python path for serverless environments
+# This ensures the 'lib' module can be found
+current_dir = Path(__file__).parent
+if str(current_dir) not in sys.path:
+    sys.path.insert(0, str(current_dir))
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, HttpUrl
-import os
 import requests
 import base64
 import time
@@ -15,7 +24,6 @@ import uuid
 from datetime import datetime
 from supabase import create_client, Client
 from dotenv import load_dotenv
-from io import BytesIO
 from PIL import Image as PILImage
 from google import genai
 from google.genai import types
