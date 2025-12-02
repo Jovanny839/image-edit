@@ -4,9 +4,19 @@ from pathlib import Path
 
 # Add current directory to Python path for serverless environments
 # This ensures the 'lib' module can be found
-current_dir = Path(__file__).parent
-if str(current_dir) not in sys.path:
-    sys.path.insert(0, str(current_dir))
+# Use absolute path resolution for Vercel/serverless compatibility
+current_dir = Path(__file__).resolve().parent
+current_dir_str = str(current_dir)
+
+# Add both the current directory and its parent to sys.path
+# This handles different deployment structures
+if current_dir_str not in sys.path:
+    sys.path.insert(0, current_dir_str)
+
+# Also try adding the parent directory in case lib is at a different level
+parent_dir = current_dir.parent
+if str(parent_dir) not in sys.path:
+    sys.path.insert(0, str(parent_dir))
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -28,7 +38,47 @@ from PIL import Image as PILImage
 from google import genai
 from google.genai import types
 from google.genai.types import Image as GeminiImage
-from lib.story_lib import generate_story
+
+# Import story_lib with robust handling for serverless environments
+# Use importlib for direct file loading which works better in Vercel/serverless
+import importlib.util
+
+# Try multiple possible paths for the story_lib module
+lib_paths = [
+    current_dir / "lib" / "story_lib.py",  # Standard location
+    current_dir / "story_lib.py",  # Fallback: root directory
+    Path("/var/task/lib/story_lib.py"),  # Vercel deployment path
+    Path("/var/task/story_lib.py"),  # Vercel root path
+]
+
+story_lib_module = None
+for lib_path in lib_paths:
+    if lib_path.exists():
+        try:
+            spec = importlib.util.spec_from_file_location("story_lib", lib_path)
+            if spec and spec.loader:
+                story_lib_module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(story_lib_module)
+                break
+        except Exception as e:
+            continue
+
+# If direct file loading didn't work, try standard import
+if story_lib_module is None:
+    try:
+        from lib.story_lib import generate_story
+    except ImportError:
+        # Last resort: try importing from root
+        try:
+            import story_lib
+            generate_story = story_lib.generate_story
+        except ImportError:
+            raise ImportError(
+                f"Could not find story_lib module. Tried paths: {[str(p) for p in lib_paths]}"
+            )
+else:
+    generate_story = story_lib_module.generate_story
+
 from typing import List, Optional
 
 
