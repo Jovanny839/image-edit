@@ -32,7 +32,9 @@ logger = logging.getLogger(__name__)
 
 # === CONFIG ===
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 MODEL = "gemini-3-pro-image-preview"
+GEMINI_TEXT_MODEL = "gemini-1.5-pro"  # Model for text generation (scenes)
 
 # Supabase Configuration
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -167,10 +169,23 @@ class StoryRequest(BaseModel):
             }
         }
 
+# Page model for story pages with text and scene image
+class StoryPage(BaseModel):
+    text: str
+    scene: Optional[HttpUrl] = None  # URL to the generated scene image
+    
+    class Config:
+        schema_extra = {
+            "example": {
+                "text": "Meet Luna, a brave dragon who loves adventures. Luna has a special power: Luna can fly through clouds.",
+                "scene": "https://your-project.supabase.co/storage/v1/object/public/images/story_scene_page1_20240101_120000_abc123.jpg"
+            }
+        }
+
 # Response model for story generation
 class StoryResponse(BaseModel):
     success: bool
-    pages: List[str]
+    pages: List[StoryPage]
     full_story: str
     word_count: int
     page_word_counts: List[int]
@@ -180,11 +195,26 @@ class StoryResponse(BaseModel):
             "example": {
                 "success": True,
                 "pages": [
-                    "Meet Luna, a brave dragon who loves adventures. Luna has a special power: Luna can fly through clouds.",
-                    "While exploring, Luna discovered a magical entrance that led to the Enchanted Forest.",
-                    "Suddenly, Luna realized that a treasure hunt was beginning, and Luna was right in the middle of it.",
-                    "When the moment of truth arrived, Luna faced the challenge head-on, even though it seemed impossible at first.",
-                    "The adventure came to a wonderful conclusion, and Luna felt proud of what had been accomplished."
+                    {
+                        "text": "Meet Luna, a brave dragon who loves adventures. Luna has a special power: Luna can fly through clouds.",
+                        "scene": "https://your-project.supabase.co/storage/v1/object/public/images/story_scene_page1_20240101_120000_abc123.jpg"
+                    },
+                    {
+                        "text": "While exploring, Luna discovered a magical entrance that led to the Enchanted Forest.",
+                        "scene": "https://your-project.supabase.co/storage/v1/object/public/images/story_scene_page2_20240101_120001_def456.jpg"
+                    },
+                    {
+                        "text": "Suddenly, Luna realized that a treasure hunt was beginning, and Luna was right in the middle of it.",
+                        "scene": "https://your-project.supabase.co/storage/v1/object/public/images/story_scene_page3_20240101_120002_ghi789.jpg"
+                    },
+                    {
+                        "text": "When the moment of truth arrived, Luna faced the challenge head-on, even though it seemed impossible at first.",
+                        "scene": "https://your-project.supabase.co/storage/v1/object/public/images/story_scene_page4_20240101_120003_jkl012.jpg"
+                    },
+                    {
+                        "text": "The adventure came to a wonderful conclusion, and Luna felt proud of what had been accomplished.",
+                        "scene": "https://your-project.supabase.co/storage/v1/object/public/images/story_scene_page5_20240101_120004_mno345.jpg"
+                    }
                 ],
                 "full_story": "Meet Luna, a brave dragon who loves adventures...",
                 "word_count": 250,
@@ -471,6 +501,149 @@ def edit_image(image_data, prompt, image_url=None):
         logger.error(f"Error calling Gemini API: {e}")
         raise HTTPException(status_code=500, detail=f"Error from Gemini API: {str(e)}")
 
+def generate_story_scene_image(story_page_text: str, page_number: int, character_name: str, character_type: str, story_world: str) -> str:
+    """Generate a scene image for a story page using Gemini Pro image preview model and return the image URL."""
+    if not gemini_client:
+        logger.warning("Gemini client not available, returning empty scene URL")
+        return ""
+    
+    logger.info(f"Generating scene image for page {page_number} using Gemini Pro image preview model")
+    
+    try:
+        # Create a detailed prompt for image generation
+        prompt = f"""Create a beautiful, colorful children's storybook illustration for this story page.
+
+STORY PAGE TEXT (Page {page_number}):
+{story_page_text}
+
+CHARACTER INFORMATION:
+- Character Name: {character_name}
+- Character Type: {character_type}
+- Story World: {story_world}
+
+ILLUSTRATION REQUIREMENTS:
+1. Create a vibrant, age-appropriate children's book illustration
+2. Include the main character ({character_name}) as a {character_type}
+3. Match the mood, setting, and events from the story text
+4. Use bright, cheerful colors suitable for children
+5. Make it visually appealing and engaging
+6. Ensure the scene is positive and appropriate for children
+7. Include relevant details about the setting and characters
+8. Style should be like a professional children's book illustration
+
+Generate a high-quality illustration that perfectly captures this story moment."""
+
+        start_time = time.time()
+        
+        # Generate image using Gemini Pro image preview model (text-to-image)
+        response = gemini_client.models.generate_content(
+            model=MODEL,  # Use gemini-3-pro-image-preview for image generation
+            contents=[
+                {
+                    "role": "user",
+                    "parts": [{"text": prompt}]
+                }
+            ],
+            config=types.GenerateContentConfig(
+                response_modalities=['IMAGE']  # Request only image output
+            )
+        )
+        
+        elapsed = time.time() - start_time
+        logger.info(f"Gemini API response received in {elapsed:.2f} seconds")
+        
+        # Extract image from response (similar to edit_image function)
+        scene_image_bytes = None
+        for part in response.parts:
+            # Check inline_data first
+            if hasattr(part, 'inline_data'):
+                try:
+                    inline_data = part.inline_data
+                    if inline_data and hasattr(inline_data, 'data'):
+                        data = inline_data.data
+                        if isinstance(data, bytes):
+                            scene_image_bytes = data
+                            logger.info(f"✅ Image extracted from inline_data.data (bytes) ({len(scene_image_bytes)} bytes)")
+                        elif isinstance(data, str):
+                            try:
+                                scene_image_bytes = base64.b64decode(data)
+                                logger.info(f"✅ Image extracted from inline_data.data (base64) ({len(scene_image_bytes)} bytes)")
+                            except Exception as e:
+                                logger.warning(f"Failed to decode base64 data: {e}")
+                                scene_image_bytes = data.encode('latin-1')
+                                logger.info(f"✅ Image extracted from inline_data.data (string) ({len(scene_image_bytes)} bytes)")
+                    elif inline_data and hasattr(inline_data, 'bytes'):
+                        scene_image_bytes = inline_data.bytes
+                        logger.info(f"✅ Image extracted from inline_data.bytes ({len(scene_image_bytes)} bytes)")
+                    
+                    if scene_image_bytes and len(scene_image_bytes) > 1000:
+                        break
+                except Exception as e:
+                    logger.warning(f"Error extracting from inline_data: {e}")
+            
+            # Fallback to as_image() if inline_data didn't work
+            if not scene_image_bytes and hasattr(part, 'as_image'):
+                try:
+                    gemini_image = part.as_image()
+                    if isinstance(gemini_image, PILImage.Image):
+                        img_buffer = BytesIO()
+                        gemini_image.save(img_buffer, format='PNG')
+                        scene_image_bytes = img_buffer.getvalue()
+                        logger.info(f"✅ Image extracted from PIL Image ({len(scene_image_bytes)} bytes)")
+                        break
+                    elif hasattr(gemini_image, 'to_bytes'):
+                        scene_image_bytes = gemini_image.to_bytes()
+                    elif hasattr(gemini_image, 'bytes'):
+                        scene_image_bytes = gemini_image.bytes
+                    elif hasattr(gemini_image, 'data'):
+                        data = gemini_image.data
+                        if isinstance(data, bytes):
+                            scene_image_bytes = data
+                        elif isinstance(data, str):
+                            scene_image_bytes = base64.b64decode(data)
+                    
+                    if scene_image_bytes and len(scene_image_bytes) > 1000:
+                        break
+                except Exception as e:
+                    logger.warning(f"Error extracting from as_image(): {e}")
+        
+        if not scene_image_bytes:
+            logger.error(f"No valid image found in response for page {page_number}")
+            return ""
+        
+        # Validate that we have a valid image
+        try:
+            test_image = PILImage.open(BytesIO(scene_image_bytes))
+            logger.info(f"✅ Validated image: {test_image.size[0]}x{test_image.size[1]}, format: {test_image.format}")
+        except Exception as e:
+            logger.error(f"Extracted data is not a valid image: {e}")
+            return ""
+        
+        # Optimize image to JPG format
+        logger.info("Optimizing scene image to JPG format...")
+        optimized_image = optimize_image_to_jpg(scene_image_bytes)
+        
+        # Generate unique filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        unique_id = str(uuid.uuid4())[:8]
+        filename = f"story_scene_page{page_number}_{timestamp}_{unique_id}.jpg"
+        
+        # Upload to Supabase and get URL
+        storage_result = upload_to_supabase(optimized_image, filename)
+        
+        if storage_result.get("uploaded") and storage_result.get("url"):
+            logger.info(f"✅ Scene image generated and uploaded for page {page_number}: {storage_result['url']}")
+            return storage_result['url']
+        else:
+            logger.warning(f"Failed to upload scene image for page {page_number}")
+            return ""
+        
+    except Exception as e:
+        logger.error(f"Error generating scene image for page {page_number}: {e}")
+        import traceback
+        logger.debug(f"Traceback: {traceback.format_exc()}")
+        return ""
+
 @app.get("/")
 async def root():
     """Root endpoint with API information"""
@@ -489,6 +662,7 @@ async def health_check():
         "timestamp": time.time(),
         "gemini_api_key_configured": bool(GEMINI_API_KEY),
         "gemini_client_initialized": bool(gemini_client is not None),
+        "openai_api_key_configured": bool(OPENAI_API_KEY),
         "model": MODEL,
         "supabase_configured": bool(supabase is not None),
         "storage_bucket": STORAGE_BUCKET if supabase else None
@@ -588,7 +762,21 @@ async def generate_story_endpoint(request: StoryRequest):
         logger.info(f"Generating story for character: {request.character_name}")
         logger.info(f"Age group: {request.age_group}, Adventure: {request.adventure_type}")
         
-        # Generate the story using the story library
+        # Validate API keys
+        if not OPENAI_API_KEY:
+            raise HTTPException(
+                status_code=500,
+                detail="OpenAI API key not configured. Please set OPENAI_API_KEY environment variable."
+            )
+        
+        if not GEMINI_API_KEY or not gemini_client:
+            raise HTTPException(
+                status_code=500,
+                detail="Gemini API key not configured or client not initialized. Please set GEMINI_API_KEY environment variable."
+            )
+        
+        # Generate the story using OpenAI (GPT-4) via the story library
+        logger.info("Generating story with OpenAI GPT-4...")
         story_result = generate_story(
             character_name=request.character_name,
             character_type=request.character_type,
@@ -597,14 +785,40 @@ async def generate_story_endpoint(request: StoryRequest):
             story_world=request.story_world,
             adventure_type=request.adventure_type,
             occasion_theme=request.occasion_theme,
-            use_api=False  # Use template-based generation
+            use_api=True,  # Use OpenAI API for story generation
+            api_key=OPENAI_API_KEY
         )
         
         logger.info(f"Story generated successfully. Word count: {story_result['word_count']}")
         
+        # Generate scene images for each page using Gemini Pro image preview model
+        logger.info("Generating scene images with Gemini Pro image preview model for each story page...")
+        story_pages = []
+        for i, page_text in enumerate(story_result['pages'], 1):
+            logger.info(f"Generating scene image for page {i}/5...")
+            scene_url = generate_story_scene_image(
+                story_page_text=page_text,
+                page_number=i,
+                character_name=request.character_name,
+                character_type=request.character_type,
+                story_world=request.story_world
+            )
+            # Convert string URL to HttpUrl if not empty, otherwise None
+            scene_http_url = None
+            if scene_url:
+                try:
+                    scene_http_url = HttpUrl(scene_url)
+                except Exception as e:
+                    logger.warning(f"Invalid scene URL for page {i}: {e}")
+                    scene_http_url = None
+            
+            story_pages.append(StoryPage(text=page_text, scene=scene_http_url))
+        
+        logger.info("All scene images generated successfully")
+        
         return StoryResponse(
             success=True,
-            pages=story_result['pages'],
+            pages=story_pages,
             full_story=story_result['full_story'],
             word_count=story_result['word_count'],
             page_word_counts=story_result['page_word_counts']

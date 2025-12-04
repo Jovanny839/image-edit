@@ -451,11 +451,11 @@ def _generate_with_api(
 ) -> Dict[str, any]:
     """Generate story using OpenAI API."""
     try:
-        import openai
+        from openai import OpenAI
     except ImportError:
         raise ImportError("OpenAI package not installed. Install it with: pip install openai")
     
-    openai.api_key = api_key
+    client = OpenAI(api_key=api_key)
     
     age_config = AGE_CONFIGS[age_group]
     
@@ -535,7 +535,7 @@ PAGE 5:
 [content]
 """
     
-    response = openai.ChatCompletion.create(
+    response = client.chat.completions.create(
         model="gpt-4",
         messages=[
             {"role": "system", "content": "You are a children's story writer who creates age-appropriate, positive, and educational stories."},

@@ -6,3 +6,4 @@ python-dotenv==1.1.1
 Pillow==10.4.0
 supabase
 google-genai
+openai
