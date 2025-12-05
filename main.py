@@ -530,8 +530,9 @@ ILLUSTRATION REQUIREMENTS:
 6. Ensure the scene is positive and appropriate for children
 7. Include relevant details about the setting and characters
 8. Style should be like a professional children's book illustration
+9. IMPORTANT: The image must be in 16:9 aspect ratio (widescreen format)
 
-Generate a high-quality illustration that perfectly captures this story moment."""
+Generate a high-quality illustration that perfectly captures this story moment in 16:9 aspect ratio."""
 
         start_time = time.time()
         
