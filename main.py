@@ -562,6 +562,7 @@ STORY PAGE TEXT (Page {page_number}):
 
 CHARACTER INFORMATION:
 - Character Name: {character_name}
+- Character Type: {character_type}
 - Story World: {story_world}
 {character_reference_note}
 ILLUSTRATION REQUIREMENTS:
