@@ -503,29 +503,17 @@ def edit_image(image_data, prompt, image_url=None):
         logger.error(f"Error calling Gemini API: {e}")
         raise HTTPException(status_code=500, detail=f"Error from Gemini API: {str(e)}")
 
-def generate_story_scene_image(story_page_text: str, page_number: int, character_name: str, character_type: str, story_world: str, reference_image_url: Optional[str] = None) -> str:
+def generate_story_scene_image(story_page_text: str, page_number: int, character_name: str, character_type: str, story_world: str, reference_image_data: Optional[bytes] = None, reference_image_mime: Optional[str] = None) -> str:
     """Generate a scene image for a story page using Gemini Pro image preview model and return the image URL."""
     if not gemini_client:
         logger.warning("Gemini client not available, returning empty scene URL")
         return ""
     
     logger.info(f"Generating scene image for page {page_number} using Gemini Pro image preview model")
-    if reference_image_url:
-        logger.info(f"Using reference character image from: {reference_image_url}")
+    if reference_image_data:
+        logger.info(f"Using reference character image (already downloaded: {len(reference_image_data)} bytes, {reference_image_mime})")
     
     try:
-        # Download reference image if provided
-        reference_image_data = None
-        reference_image_mime = None
-        if reference_image_url:
-            try:
-                logger.info(f"Downloading reference image from: {reference_image_url}")
-                reference_image_data = download_image_from_url(reference_image_url)
-                reference_image_mime = detect_image_mime_type(reference_image_data)
-                logger.info(f"✅ Reference image downloaded successfully ({len(reference_image_data)} bytes, {reference_image_mime})")
-            except Exception as e:
-                logger.warning(f"Failed to download reference image, continuing without it: {e}")
-                reference_image_data = None
         
         # Create a detailed prompt for image generation
         character_reference_note = ""
@@ -834,9 +822,22 @@ async def generate_story_endpoint(request: StoryRequest):
         
         logger.info(f"Story generated successfully. Word count: {story_result['word_count']}")
         
+        # Download reference image once if provided (to avoid multiple downloads and hitting AFC limits)
+        reference_image_data = None
+        reference_image_mime = None
+        if request.reference_image:
+            try:
+                reference_image_url = str(request.reference_image)
+                logger.info(f"Downloading reference character image once from: {reference_image_url}")
+                reference_image_data = download_image_from_url(reference_image_url)
+                reference_image_mime = detect_image_mime_type(reference_image_data)
+                logger.info(f"✅ Reference image downloaded successfully ({len(reference_image_data)} bytes, {reference_image_mime})")
+            except Exception as e:
+                logger.warning(f"Failed to download reference image, continuing without it: {e}")
+                reference_image_data = None
+        
         # Generate scene images for each page using Gemini Pro image preview model
         logger.info("Generating scene images with Gemini Pro image preview model for each story page...")
-        reference_image_url = str(request.reference_image) if request.reference_image else None
         story_pages = []
         for i, page_text in enumerate(story_result['pages'], 1):
             logger.info(f"Generating scene image for page {i}/5...")
@@ -846,51 +847,29 @@ async def generate_story_endpoint(request: StoryRequest):
                 character_name=request.character_name,
                 character_type=request.character_type,
                 story_world=request.story_world,
-                reference_image_url=reference_image_url
+                reference_image_data=reference_image_data,
+                reference_image_mime=reference_image_mime
             )
             # Convert string URL to HttpUrl if not empty, otherwise None
             scene_http_url = None
-            if scene_url and scene_url.strip():
+            if scene_url:
                 try:
-                    scene_http_url = HttpUrl(scene_url.strip())
-                    logger.debug(f"Page {i}: Scene URL validated successfully")
+                    scene_http_url = HttpUrl(scene_url)
                 except Exception as e:
-                    logger.warning(f"Invalid scene URL for page {i}: {e} (URL: {scene_url[:50]}...)")
+                    logger.warning(f"Invalid scene URL for page {i}: {e}")
                     scene_http_url = None
-            else:
-                logger.warning(f"Page {i}: No scene URL provided (empty or None)")
             
-            try:
-                story_pages.append(StoryPage(text=page_text, scene=scene_http_url))
-            except Exception as e:
-                logger.error(f"Error creating StoryPage for page {i}: {e}")
-                # Create page without scene if there's an error
-                story_pages.append(StoryPage(text=page_text, scene=None))
+            story_pages.append(StoryPage(text=page_text, scene=scene_http_url))
         
         logger.info("All scene images generated successfully")
         
-        # Log summary before creating response
-        logger.info(f"Preparing response: {len(story_pages)} pages, word_count={story_result['word_count']}")
-        for i, page in enumerate(story_pages, 1):
-            scene_info = "with scene" if page.scene else "without scene"
-            logger.info(f"Page {i}: {len(page.text)} chars, {scene_info}")
-        
-        try:
-            response = StoryResponse(
-                success=True,
-                pages=story_pages,
-                full_story=story_result['full_story'],
-                word_count=story_result['word_count'],
-                page_word_counts=story_result['page_word_counts']
-            )
-            logger.info("✅ StoryResponse created successfully")
-            logger.info(f"Response summary: {len(story_pages)} pages, {story_result['word_count']} words, returning to client...")
-            return response
-        except Exception as e:
-            logger.error(f"❌ Error creating StoryResponse: {e}")
-            import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            raise HTTPException(status_code=500, detail=f"Error creating response: {str(e)}")
+        return StoryResponse(
+            success=True,
+            pages=story_pages,
+            full_story=story_result['full_story'],
+            word_count=story_result['word_count'],
+            page_word_counts=story_result['page_word_counts']
+        )
         
     except ValueError as e:
         logger.error(f"Validation error: {e}")
