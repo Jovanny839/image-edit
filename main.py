@@ -558,10 +558,10 @@ CHARACTER REFERENCE:
 
 STORY PAGE TEXT (Page {page_number}):
 {story_page_text}
+- Embed this story page text into the image naturally.
 
 CHARACTER INFORMATION:
 - Character Name: {character_name}
-- Character Type: {character_type}
 - Story World: {story_world}
 {character_reference_note}
 ILLUSTRATION REQUIREMENTS:
