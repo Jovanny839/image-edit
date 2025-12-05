@@ -155,7 +155,7 @@ class StoryRequest(BaseModel):
     story_world: str
     adventure_type: str
     occasion_theme: Optional[str] = None
-    reference_image: Optional[HttpUrl] = None  # Supabase URL of the character reference image
+    character_image_url: Optional[HttpUrl] = None  # Supabase URL of the character reference image
     
     class Config:
         schema_extra = {
@@ -167,7 +167,7 @@ class StoryRequest(BaseModel):
                 "story_world": "the Enchanted Forest",
                 "adventure_type": "treasure hunt",
                 "occasion_theme": None,
-                "reference_image": "https://your-project.supabase.co/storage/v1/object/public/images/character_reference.jpg"
+                "character_image_url": "https://your-project.supabase.co/storage/v1/object/public/images/character_reference.jpg"
             }
         }
 
