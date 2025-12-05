@@ -155,6 +155,7 @@ class StoryRequest(BaseModel):
     story_world: str
     adventure_type: str
     occasion_theme: Optional[str] = None
+    reference_image: Optional[HttpUrl] = None  # Supabase URL of the character reference image
     
     class Config:
         schema_extra = {
@@ -165,7 +166,8 @@ class StoryRequest(BaseModel):
                 "age_group": "7-10",
                 "story_world": "the Enchanted Forest",
                 "adventure_type": "treasure hunt",
-                "occasion_theme": None
+                "occasion_theme": None,
+                "reference_image": "https://your-project.supabase.co/storage/v1/object/public/images/character_reference.jpg"
             }
         }
 
@@ -501,16 +503,41 @@ def edit_image(image_data, prompt, image_url=None):
         logger.error(f"Error calling Gemini API: {e}")
         raise HTTPException(status_code=500, detail=f"Error from Gemini API: {str(e)}")
 
-def generate_story_scene_image(story_page_text: str, page_number: int, character_name: str, character_type: str, story_world: str) -> str:
+def generate_story_scene_image(story_page_text: str, page_number: int, character_name: str, character_type: str, story_world: str, reference_image_url: Optional[str] = None) -> str:
     """Generate a scene image for a story page using Gemini Pro image preview model and return the image URL."""
     if not gemini_client:
         logger.warning("Gemini client not available, returning empty scene URL")
         return ""
     
     logger.info(f"Generating scene image for page {page_number} using Gemini Pro image preview model")
+    if reference_image_url:
+        logger.info(f"Using reference character image from: {reference_image_url}")
     
     try:
+        # Download reference image if provided
+        reference_image_data = None
+        reference_image_mime = None
+        if reference_image_url:
+            try:
+                logger.info(f"Downloading reference image from: {reference_image_url}")
+                reference_image_data = download_image_from_url(reference_image_url)
+                reference_image_mime = detect_image_mime_type(reference_image_data)
+                logger.info(f"✅ Reference image downloaded successfully ({len(reference_image_data)} bytes, {reference_image_mime})")
+            except Exception as e:
+                logger.warning(f"Failed to download reference image, continuing without it: {e}")
+                reference_image_data = None
+        
         # Create a detailed prompt for image generation
+        character_reference_note = ""
+        if reference_image_data:
+            character_reference_note = f"""
+CHARACTER REFERENCE:
+- A reference image of {character_name} is provided below
+- Use this reference image to maintain consistent character appearance across all scenes
+- The character in the scene must match the appearance, style, and features shown in the reference image
+- Keep the character's visual identity consistent with the reference image
+"""
+        
         prompt = f"""Create a beautiful, colorful children's storybook illustration for this story page.
 
 STORY PAGE TEXT (Page {page_number}):
@@ -520,7 +547,7 @@ CHARACTER INFORMATION:
 - Character Name: {character_name}
 - Character Type: {character_type}
 - Story World: {story_world}
-
+{character_reference_note}
 ILLUSTRATION REQUIREMENTS:
 1. Create a vibrant, age-appropriate children's book illustration
 2. Include the main character ({character_name}) as a {character_type}
@@ -531,10 +558,25 @@ ILLUSTRATION REQUIREMENTS:
 7. Include relevant details about the setting and characters
 8. Style should be like a professional children's book illustration
 9. IMPORTANT: The image must be in 16:9 aspect ratio (widescreen format)
+{"10. CRITICAL: The character must match the appearance shown in the reference image provided" if reference_image_data else ""}
 
 Generate a high-quality illustration that perfectly captures this story moment in 16:9 aspect ratio."""
 
         start_time = time.time()
+        
+        # Prepare content parts for Gemini API
+        content_parts = [{"text": prompt}]
+        
+        # Add reference image if available
+        if reference_image_data and reference_image_mime:
+            image_base64 = base64.b64encode(reference_image_data).decode('utf-8')
+            content_parts.append({
+                "inline_data": {
+                    "mime_type": reference_image_mime,
+                    "data": image_base64
+                }
+            })
+            logger.info("Reference image included in generation request")
         
         # Generate image using Gemini Pro image preview model (text-to-image)
         response = gemini_client.models.generate_content(
@@ -542,7 +584,7 @@ Generate a high-quality illustration that perfectly captures this story moment i
             contents=[
                 {
                     "role": "user",
-                    "parts": [{"text": prompt}]
+                    "parts": content_parts
                 }
             ],
             config=types.GenerateContentConfig(
@@ -794,6 +836,7 @@ async def generate_story_endpoint(request: StoryRequest):
         
         # Generate scene images for each page using Gemini Pro image preview model
         logger.info("Generating scene images with Gemini Pro image preview model for each story page...")
+        reference_image_url = str(request.reference_image) if request.reference_image else None
         story_pages = []
         for i, page_text in enumerate(story_result['pages'], 1):
             logger.info(f"Generating scene image for page {i}/5...")
@@ -802,7 +845,8 @@ async def generate_story_endpoint(request: StoryRequest):
                 page_number=i,
                 character_name=request.character_name,
                 character_type=request.character_type,
-                story_world=request.story_world
+                story_world=request.story_world,
+                reference_image_url=reference_image_url
             )
             # Convert string URL to HttpUrl if not empty, otherwise None
             scene_http_url = None
