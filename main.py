@@ -503,21 +503,49 @@ def edit_image(image_data, prompt, image_url=None):
         logger.error(f"Error calling Gemini API: {e}")
         raise HTTPException(status_code=500, detail=f"Error from Gemini API: {str(e)}")
 
-def generate_story_scene_image(story_page_text: str, page_number: int, character_name: str, character_type: str, story_world: str, reference_image_data: Optional[bytes] = None, reference_image_mime: Optional[str] = None) -> str:
-    """Generate a scene image for a story page using Gemini Pro image preview model and return the image URL."""
+def create_blank_base_image(width: int = 1920, height: int = 1080) -> bytes:
+    """Create a blank white image in 16:9 aspect ratio to use as base for image generation"""
+    try:
+        # Create a white image in 16:9 aspect ratio (1920x1080 default)
+        blank_image = PILImage.new('RGB', (width, height), color=(255, 255, 255))
+        img_buffer = BytesIO()
+        blank_image.save(img_buffer, format='PNG')
+        return img_buffer.getvalue()
+    except Exception as e:
+        logger.error(f"Error creating blank base image: {e}")
+        raise
+
+def generate_story_scene_image(story_page_text: str, page_number: int, character_name: str, character_type: str, story_world: str, reference_image_url: Optional[str] = None) -> str:
+    """Generate a scene image for a story page using edit_image function and return the image URL."""
     if not gemini_client:
         logger.warning("Gemini client not available, returning empty scene URL")
         return ""
     
-    logger.info(f"Generating scene image for page {page_number} using Gemini Pro image preview model")
-    if reference_image_data:
-        logger.info(f"Using reference character image (already downloaded: {len(reference_image_data)} bytes, {reference_image_mime})")
+    logger.info(f"Generating scene image for page {page_number} using edit_image function")
+    if reference_image_url:
+        logger.info(f"Using reference character image from: {reference_image_url}")
     
     try:
+        # Get base image - use reference image if provided, otherwise create a blank image
+        base_image_data = None
+        if reference_image_url:
+            try:
+                logger.info(f"Downloading reference image from: {reference_image_url}")
+                base_image_data = download_image_from_url(reference_image_url)
+                logger.info(f"✅ Reference image downloaded successfully ({len(base_image_data)} bytes)")
+            except Exception as e:
+                logger.warning(f"Failed to download reference image, creating blank base image: {e}")
+                base_image_data = None
+        
+        # If no reference image, create a blank white image in 16:9 aspect ratio
+        if not base_image_data:
+            logger.info("Creating blank base image for scene generation")
+            base_image_data = create_blank_base_image()
+            logger.info(f"✅ Blank base image created ({len(base_image_data)} bytes)")
         
         # Create a detailed prompt for image generation
         character_reference_note = ""
-        if reference_image_data:
+        if reference_image_url and base_image_data:
             character_reference_note = f"""
 CHARACTER REFERENCE:
 - A reference image of {character_name} is provided below
@@ -546,109 +574,13 @@ ILLUSTRATION REQUIREMENTS:
 7. Include relevant details about the setting and characters
 8. Style should be like a professional children's book illustration
 9. IMPORTANT: The image must be in 16:9 aspect ratio (widescreen format)
-{"10. CRITICAL: The character must match the appearance shown in the reference image provided" if reference_image_data else ""}
+{"10. CRITICAL: The character must match the appearance shown in the reference image provided" if reference_image_url and base_image_data else ""}
 
 Generate a high-quality illustration that perfectly captures this story moment in 16:9 aspect ratio."""
 
-        start_time = time.time()
-        
-        # Prepare content parts for Gemini API
-        content_parts = [{"text": prompt}]
-        
-        # Add reference image if available
-        if reference_image_data and reference_image_mime:
-            image_base64 = base64.b64encode(reference_image_data).decode('utf-8')
-            content_parts.append({
-                "inline_data": {
-                    "mime_type": reference_image_mime,
-                    "data": image_base64
-                }
-            })
-            logger.info("Reference image included in generation request")
-        
-        # Generate image using Gemini Pro image preview model (text-to-image)
-        response = gemini_client.models.generate_content(
-            model=MODEL,  # Use gemini-3-pro-image-preview for image generation
-            contents=[
-                {
-                    "role": "user",
-                    "parts": content_parts
-                }
-            ],
-            config=types.GenerateContentConfig(
-                response_modalities=['IMAGE']  # Request only image output
-            )
-        )
-        
-        elapsed = time.time() - start_time
-        logger.info(f"Gemini API response received in {elapsed:.2f} seconds")
-        
-        # Extract image from response (similar to edit_image function)
-        scene_image_bytes = None
-        for part in response.parts:
-            # Check inline_data first
-            if hasattr(part, 'inline_data'):
-                try:
-                    inline_data = part.inline_data
-                    if inline_data and hasattr(inline_data, 'data'):
-                        data = inline_data.data
-                        if isinstance(data, bytes):
-                            scene_image_bytes = data
-                            logger.info(f"✅ Image extracted from inline_data.data (bytes) ({len(scene_image_bytes)} bytes)")
-                        elif isinstance(data, str):
-                            try:
-                                scene_image_bytes = base64.b64decode(data)
-                                logger.info(f"✅ Image extracted from inline_data.data (base64) ({len(scene_image_bytes)} bytes)")
-                            except Exception as e:
-                                logger.warning(f"Failed to decode base64 data: {e}")
-                                scene_image_bytes = data.encode('latin-1')
-                                logger.info(f"✅ Image extracted from inline_data.data (string) ({len(scene_image_bytes)} bytes)")
-                    elif inline_data and hasattr(inline_data, 'bytes'):
-                        scene_image_bytes = inline_data.bytes
-                        logger.info(f"✅ Image extracted from inline_data.bytes ({len(scene_image_bytes)} bytes)")
-                    
-                    if scene_image_bytes and len(scene_image_bytes) > 1000:
-                        break
-                except Exception as e:
-                    logger.warning(f"Error extracting from inline_data: {e}")
-            
-            # Fallback to as_image() if inline_data didn't work
-            if not scene_image_bytes and hasattr(part, 'as_image'):
-                try:
-                    gemini_image = part.as_image()
-                    if isinstance(gemini_image, PILImage.Image):
-                        img_buffer = BytesIO()
-                        gemini_image.save(img_buffer, format='PNG')
-                        scene_image_bytes = img_buffer.getvalue()
-                        logger.info(f"✅ Image extracted from PIL Image ({len(scene_image_bytes)} bytes)")
-                        break
-                    elif hasattr(gemini_image, 'to_bytes'):
-                        scene_image_bytes = gemini_image.to_bytes()
-                    elif hasattr(gemini_image, 'bytes'):
-                        scene_image_bytes = gemini_image.bytes
-                    elif hasattr(gemini_image, 'data'):
-                        data = gemini_image.data
-                        if isinstance(data, bytes):
-                            scene_image_bytes = data
-                        elif isinstance(data, str):
-                            scene_image_bytes = base64.b64decode(data)
-                    
-                    if scene_image_bytes and len(scene_image_bytes) > 1000:
-                        break
-                except Exception as e:
-                    logger.warning(f"Error extracting from as_image(): {e}")
-        
-        if not scene_image_bytes:
-            logger.error(f"No valid image found in response for page {page_number}")
-            return ""
-        
-        # Validate that we have a valid image
-        try:
-            test_image = PILImage.open(BytesIO(scene_image_bytes))
-            logger.info(f"✅ Validated image: {test_image.size[0]}x{test_image.size[1]}, format: {test_image.format}")
-        except Exception as e:
-            logger.error(f"Extracted data is not a valid image: {e}")
-            return ""
+        # Use edit_image function to generate the scene
+        logger.info(f"Calling edit_image function with prompt for page {page_number}")
+        scene_image_bytes = edit_image(base_image_data, prompt, reference_image_url)
         
         # Optimize image to JPG format
         logger.info("Optimizing scene image to JPG format...")
@@ -669,6 +601,9 @@ Generate a high-quality illustration that perfectly captures this story moment i
             logger.warning(f"Failed to upload scene image for page {page_number}")
             return ""
         
+    except HTTPException as e:
+        logger.error(f"HTTP error generating scene image for page {page_number}: {e.detail}")
+        return ""
     except Exception as e:
         logger.error(f"Error generating scene image for page {page_number}: {e}")
         import traceback
@@ -822,22 +757,9 @@ async def generate_story_endpoint(request: StoryRequest):
         
         logger.info(f"Story generated successfully. Word count: {story_result['word_count']}")
         
-        # Download reference image once if provided (to avoid multiple downloads and hitting AFC limits)
-        reference_image_data = None
-        reference_image_mime = None
-        if request.reference_image:
-            try:
-                reference_image_url = str(request.reference_image)
-                logger.info(f"Downloading reference character image once from: {reference_image_url}")
-                reference_image_data = download_image_from_url(reference_image_url)
-                reference_image_mime = detect_image_mime_type(reference_image_data)
-                logger.info(f"✅ Reference image downloaded successfully ({len(reference_image_data)} bytes, {reference_image_mime})")
-            except Exception as e:
-                logger.warning(f"Failed to download reference image, continuing without it: {e}")
-                reference_image_data = None
-        
         # Generate scene images for each page using Gemini Pro image preview model
         logger.info("Generating scene images with Gemini Pro image preview model for each story page...")
+        reference_image_url = str(request.reference_image) if request.reference_image else None
         story_pages = []
         for i, page_text in enumerate(story_result['pages'], 1):
             logger.info(f"Generating scene image for page {i}/5...")
@@ -847,8 +769,7 @@ async def generate_story_endpoint(request: StoryRequest):
                 character_name=request.character_name,
                 character_type=request.character_type,
                 story_world=request.story_world,
-                reference_image_data=reference_image_data,
-                reference_image_mime=reference_image_mime
+                reference_image_url=reference_image_url
             )
             # Convert string URL to HttpUrl if not empty, otherwise None
             scene_http_url = None
