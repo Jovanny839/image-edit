@@ -850,24 +850,47 @@ async def generate_story_endpoint(request: StoryRequest):
             )
             # Convert string URL to HttpUrl if not empty, otherwise None
             scene_http_url = None
-            if scene_url:
+            if scene_url and scene_url.strip():
                 try:
-                    scene_http_url = HttpUrl(scene_url)
+                    scene_http_url = HttpUrl(scene_url.strip())
+                    logger.debug(f"Page {i}: Scene URL validated successfully")
                 except Exception as e:
-                    logger.warning(f"Invalid scene URL for page {i}: {e}")
+                    logger.warning(f"Invalid scene URL for page {i}: {e} (URL: {scene_url[:50]}...)")
                     scene_http_url = None
+            else:
+                logger.warning(f"Page {i}: No scene URL provided (empty or None)")
             
-            story_pages.append(StoryPage(text=page_text, scene=scene_http_url))
+            try:
+                story_pages.append(StoryPage(text=page_text, scene=scene_http_url))
+            except Exception as e:
+                logger.error(f"Error creating StoryPage for page {i}: {e}")
+                # Create page without scene if there's an error
+                story_pages.append(StoryPage(text=page_text, scene=None))
         
         logger.info("All scene images generated successfully")
         
-        return StoryResponse(
-            success=True,
-            pages=story_pages,
-            full_story=story_result['full_story'],
-            word_count=story_result['word_count'],
-            page_word_counts=story_result['page_word_counts']
-        )
+        # Log summary before creating response
+        logger.info(f"Preparing response: {len(story_pages)} pages, word_count={story_result['word_count']}")
+        for i, page in enumerate(story_pages, 1):
+            scene_info = "with scene" if page.scene else "without scene"
+            logger.info(f"Page {i}: {len(page.text)} chars, {scene_info}")
+        
+        try:
+            response = StoryResponse(
+                success=True,
+                pages=story_pages,
+                full_story=story_result['full_story'],
+                word_count=story_result['word_count'],
+                page_word_counts=story_result['page_word_counts']
+            )
+            logger.info("✅ StoryResponse created successfully")
+            logger.info(f"Response summary: {len(story_pages)} pages, {story_result['word_count']} words, returning to client...")
+            return response
+        except Exception as e:
+            logger.error(f"❌ Error creating StoryResponse: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            raise HTTPException(status_code=500, detail=f"Error creating response: {str(e)}")
         
     except ValueError as e:
         logger.error(f"Validation error: {e}")
