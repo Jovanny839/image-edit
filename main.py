@@ -759,7 +759,7 @@ async def generate_story_endpoint(request: StoryRequest):
         
         # Generate scene images for each page using Gemini Pro image preview model
         logger.info("Generating scene images with Gemini Pro image preview model for each story page...")
-        reference_image_url = str(request.reference_image) if request.reference_image else None
+        reference_image_url = str(request.character_image_url) if request.character_image_url else None
         story_pages = []
         for i, page_text in enumerate(story_result['pages'], 1):
             logger.info(f"Generating scene image for page {i}/5...")
