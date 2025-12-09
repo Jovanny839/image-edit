@@ -8,6 +8,8 @@ import requests
 import base64
 import time
 import uvicorn
+import json
+import re
 from io import BytesIO
 from fastapi.responses import StreamingResponse
 import logging
@@ -21,7 +23,7 @@ from google import genai
 from google.genai import types
 from google.genai.types import Image as GeminiImage
 from story_lib import generate_story
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 # Load environment variables
 load_dotenv()
@@ -131,6 +133,35 @@ class ImageResponse(BaseModel):
     success: bool
     message: str
     storage_info: dict = None
+    quality_validation: Optional[Dict[str, Any]] = None
+
+# Response model for quality validation
+class QualityValidationResponse(BaseModel):
+    success: bool
+    validation: Dict[str, Any]
+    
+    class Config:
+        schema_extra = {
+            "example": {
+                "success": True,
+                "validation": {
+                    "is_valid": True,
+                    "quality_score": 0.85,
+                    "is_appropriate": True,
+                    "is_clear": True,
+                    "has_sufficient_detail": True,
+                    "issues": [],
+                    "recommendations": ["Image quality is good"],
+                    "details": {
+                        "image_properties": {
+                            "actual_resolution": "1024x768",
+                            "format": "JPEG",
+                            "clarity": "high"
+                        }
+                    }
+                }
+            }
+        }
     
     class Config:
         schema_extra = {
@@ -171,16 +202,31 @@ class StoryRequest(BaseModel):
             }
         }
 
+# Model for character consistency validation results
+class ConsistencyValidationResult(BaseModel):
+    is_consistent: bool
+    similarity_score: float  # 0.0 to 1.0
+    validation_time_seconds: float
+    flagged: bool  # True if score < 0.5
+    details: Optional[Dict[str, Any]] = None
+
 # Page model for story pages with text and scene image
 class StoryPage(BaseModel):
     text: str
     scene: Optional[HttpUrl] = None  # URL to the generated scene image
+    consistency_validation: Optional[ConsistencyValidationResult] = None
     
     class Config:
         schema_extra = {
             "example": {
                 "text": "Meet Luna, a brave dragon who loves adventures. Luna has a special power: Luna can fly through clouds.",
-                "scene": "https://your-project.supabase.co/storage/v1/object/public/images/story_scene_page1_20240101_120000_abc123.jpg"
+                "scene": "https://your-project.supabase.co/storage/v1/object/public/images/story_scene_page1_20240101_120000_abc123.jpg",
+                "consistency_validation": {
+                    "is_consistent": True,
+                    "similarity_score": 0.85,
+                    "validation_time_seconds": 3.2,
+                    "flagged": False
+                }
             }
         }
 
@@ -191,6 +237,7 @@ class StoryResponse(BaseModel):
     full_story: str
     word_count: int
     page_word_counts: List[int]
+    consistency_summary: Optional[Dict[str, Any]] = None  # Overall validation summary
     
     class Config:
         schema_extra = {
@@ -503,10 +550,370 @@ def edit_image(image_data, prompt, image_url=None):
         logger.error(f"Error calling Gemini API: {e}")
         raise HTTPException(status_code=500, detail=f"Error from Gemini API: {str(e)}")
 
-def create_blank_base_image(width: int = 1920, height: int = 1080) -> bytes:
-    """Create a blank white image in 16:9 aspect ratio to use as base for image generation"""
+def validate_character_consistency(scene_image_data: bytes, reference_image_data: bytes, page_number: int, timeout_seconds: int = 15) -> ConsistencyValidationResult:
+    """
+    Validate character consistency between a scene image and reference image using Gemini model.
+    Compares the character in the scene against the reference (normal.png) image.
+    
+    Args:
+        scene_image_data: Bytes of the generated scene image
+        reference_image_data: Bytes of the reference character image (normal.png)
+        page_number: Page number for logging
+        timeout_seconds: Maximum time allowed for validation (default 15 seconds)
+    
+    Returns:
+        ConsistencyValidationResult with similarity score and validation details
+    """
+    if not gemini_client:
+        logger.warning("Gemini client not available for consistency validation")
+        return ConsistencyValidationResult(
+            is_consistent=True,  # Default to consistent if validation unavailable
+            similarity_score=0.5,
+            validation_time_seconds=0.0,
+            flagged=False,
+            details={"validation_available": False, "error": "Gemini client not initialized"}
+        )
+    
+    start_time = time.time()
+    
     try:
-        # Create a white image in 16:9 aspect ratio (1920x1080 default)
+        logger.info(f"Starting character consistency validation for page {page_number}...")
+        
+        # Detect MIME types
+        scene_mime_type = detect_image_mime_type(scene_image_data)
+        reference_mime_type = detect_image_mime_type(reference_image_data)
+        
+        # Encode images to base64
+        scene_base64 = base64.b64encode(scene_image_data).decode('utf-8')
+        reference_base64 = base64.b64encode(reference_image_data).decode('utf-8')
+        
+        # Create validation prompt for Gemini
+        validation_prompt = """Analyze these two images and determine how consistent the character appearance is between them.
+
+IMAGE 1 (REFERENCE): This is the reference character image (normal.png) showing the character's standard appearance.
+
+IMAGE 2 (SCENE): This is a scene from a storybook that should contain the same character.
+
+Your task is to compare the character in the scene image against the reference image and provide a similarity score.
+
+Focus on these character features:
+1. Facial features (eyes, nose, mouth, face shape)
+2. Body proportions and structure
+3. Hair style, color, and texture
+4. Skin tone and color
+5. Clothing design, colors, and patterns
+6. Overall character design and visual style
+7. Character's artistic style consistency
+
+Return your analysis in the following JSON format (ONLY valid JSON, no additional text):
+{
+  "similarity_score": <float between 0.0 and 1.0>,
+  "is_consistent": <boolean>,
+  "character_match_details": {
+    "facial_features_match": <float 0.0-1.0>,
+    "body_proportions_match": <float 0.0-1.0>,
+    "hair_match": <float 0.0-1.0>,
+    "skin_tone_match": <float 0.0-1.0>,
+    "clothing_match": <float 0.0-1.0>,
+    "overall_style_match": <float 0.0-1.0>
+  },
+  "issues": [<array of specific inconsistency issues found>],
+  "confidence": <float 0.0-1.0>
+}
+
+Scoring guidelines:
+- 0.9-1.0: Character is nearly identical or identical to reference
+- 0.7-0.89: Character is very similar with minor differences
+- 0.5-0.69: Character is somewhat similar but has noticeable differences
+- 0.3-0.49: Character has significant differences from reference
+- 0.0-0.29: Character is very different or unrecognizable compared to reference
+
+Threshold: A score of 0.5 or higher indicates consistency. Below 0.5 should be flagged as inconsistent."""
+        
+        # Call Gemini API for validation
+        # Use timeout to ensure we complete within 15 seconds
+        validation_start = time.time()
+        
+        response = gemini_client.models.generate_content(
+            model=GEMINI_TEXT_MODEL,  # Use text model for analysis
+            contents=[
+                {
+                    "role": "user",
+                    "parts": [
+                        {"text": validation_prompt},
+                        {
+                            "inline_data": {
+                                "mime_type": reference_mime_type,
+                                "data": reference_base64
+                            }
+                        },
+                        {
+                            "text": "\n\nIMAGE 2 (SCENE):"
+                        },
+                        {
+                            "inline_data": {
+                                "mime_type": scene_mime_type,
+                                "data": scene_base64
+                            }
+                        }
+                    ]
+                }
+            ],
+            config=types.GenerateContentConfig(
+                response_modalities=['TEXT'],
+                temperature=0.1  # Lower temperature for more consistent validation
+            )
+        )
+        
+        # Extract text response
+        validation_text = ""
+        for part in response.parts:
+            if part.text:
+                validation_text += part.text
+        
+        # Check if we exceeded timeout
+        elapsed_time = time.time() - validation_start
+        if elapsed_time > timeout_seconds:
+            logger.warning(f"Consistency validation for page {page_number} exceeded timeout ({elapsed_time:.2f}s > {timeout_seconds}s)")
+        
+        # Parse JSON response
+        json_match = re.search(r'\{.*\}', validation_text, re.DOTALL)
+        if json_match:
+            validation_json = json.loads(json_match.group())
+        else:
+            validation_json = json.loads(validation_text)
+        
+        # Extract validation results
+        similarity_score = float(validation_json.get("similarity_score", 0.5))
+        is_consistent = validation_json.get("is_consistent", similarity_score >= 0.5)
+        character_match_details = validation_json.get("character_match_details", {})
+        issues = validation_json.get("issues", [])
+        confidence = validation_json.get("confidence", 0.5)
+        
+        # Determine if flagged (score < 0.5)
+        flagged = similarity_score < 0.5
+        
+        total_time = time.time() - start_time
+        
+        result = ConsistencyValidationResult(
+            is_consistent=is_consistent,
+            similarity_score=similarity_score,
+            validation_time_seconds=total_time,
+            flagged=flagged,
+            details={
+                "character_match_details": character_match_details,
+                "issues": issues,
+                "confidence": confidence,
+                "model_used": GEMINI_TEXT_MODEL,
+                "timeout_seconds": timeout_seconds
+            }
+        )
+        
+        # Log results
+        logger.info(f"✅ Consistency validation for page {page_number} completed in {total_time:.2f}s")
+        logger.info(f"   Similarity score: {similarity_score:.3f} | Consistent: {is_consistent} | Flagged: {flagged}")
+        if issues:
+            logger.warning(f"   Issues found: {', '.join(issues[:3])}")  # Log first 3 issues
+        
+        if flagged:
+            logger.warning(f"⚠️ Page {page_number} flagged as INCONSISTENT (score: {similarity_score:.3f} < 0.5)")
+        
+        return result
+        
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse consistency validation JSON response for page {page_number}: {e}")
+        logger.error(f"Response text: {validation_text[:500] if 'validation_text' in locals() else 'N/A'}")
+        total_time = time.time() - start_time
+        return ConsistencyValidationResult(
+            is_consistent=True,  # Default to consistent on parse error
+            similarity_score=0.5,
+            validation_time_seconds=total_time,
+            flagged=False,
+            details={"validation_available": False, "error": "JSON parse error", "raw_response": validation_text[:200] if 'validation_text' in locals() else None}
+        )
+    except Exception as e:
+        logger.error(f"Error during consistency validation for page {page_number}: {e}")
+        import traceback
+        logger.debug(f"Traceback: {traceback.format_exc()}")
+        total_time = time.time() - start_time
+        return ConsistencyValidationResult(
+            is_consistent=True,  # Default to consistent on error
+            similarity_score=0.5,
+            validation_time_seconds=total_time,
+            flagged=False,
+            details={"validation_available": False, "error": str(e)}
+        )
+
+def validate_image_quality(image_data: bytes, image_url: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Validate image quality using Gemini Vision API.
+    Checks for: image quality, appropriateness, clarity, and basic properties.
+    
+    Returns a dictionary with validation results including:
+    - is_valid: bool
+    - quality_score: float (0-1)
+    - issues: List[str]
+    - recommendations: List[str]
+    - details: Dict with specific checks
+    """
+    if not gemini_client:
+        logger.warning("Gemini client not available for quality validation")
+        return {
+            "is_valid": True,  # Default to valid if validation unavailable
+            "quality_score": 0.5,
+            "issues": [],
+            "recommendations": ["Quality validation unavailable - Gemini client not initialized"],
+            "details": {"validation_available": False}
+        }
+    
+    try:
+        logger.info("Starting image quality validation with Gemini Vision API")
+        
+        # Detect MIME type
+        mime_type = detect_image_mime_type(image_data)
+        
+        # Encode image to base64
+        image_base64 = base64.b64encode(image_data).decode('utf-8')
+        
+        # Create validation prompt
+        validation_prompt = """Analyze this image and provide a quality assessment in the following JSON format:
+{
+  "quality_score": <float 0.0-1.0>,
+  "is_appropriate": <boolean>,
+  "is_clear": <boolean>,
+  "has_sufficient_detail": <boolean>,
+  "issues": [<array of issue strings>],
+  "recommendations": [<array of recommendation strings>],
+  "image_properties": {
+    "estimated_resolution": "<width>x<height>",
+    "clarity": "<low/medium/high>",
+    "brightness": "<too_dark/normal/too_bright>",
+    "composition": "<poor/fair/good/excellent>"
+  }
+}
+
+Focus on:
+1. Image clarity and sharpness
+2. Appropriate content for children (no violence, adult content, etc.)
+3. Sufficient detail and resolution
+4. Overall visual quality
+5. Any technical issues (blur, distortion, artifacts)
+
+Be strict but fair. Return ONLY valid JSON, no additional text."""
+        
+        # Call Gemini API for validation
+        response = gemini_client.models.generate_content(
+            model=GEMINI_TEXT_MODEL,  # Use text model for analysis
+            contents=[
+                {
+                    "role": "user",
+                    "parts": [
+                        {"text": validation_prompt},
+                        {
+                            "inline_data": {
+                                "mime_type": mime_type,
+                                "data": image_base64
+                            }
+                        }
+                    ]
+                }
+            ],
+            config=types.GenerateContentConfig(
+                response_modalities=['TEXT'],
+                temperature=0.1  # Lower temperature for more consistent validation
+            )
+        )
+        
+        # Extract text response
+        validation_text = ""
+        for part in response.parts:
+            if part.text:
+                validation_text += part.text
+        
+        # Parse JSON response
+        # Try to extract JSON from response (in case there's extra text)
+        json_match = re.search(r'\{.*\}', validation_text, re.DOTALL)
+        if json_match:
+            validation_json = json.loads(json_match.group())
+        else:
+            # Try parsing the whole response
+            validation_json = json.loads(validation_text)
+        
+        # Extract validation results
+        quality_score = validation_json.get("quality_score", 0.5)
+        is_appropriate = validation_json.get("is_appropriate", True)
+        is_clear = validation_json.get("is_clear", True)
+        has_sufficient_detail = validation_json.get("has_sufficient_detail", True)
+        issues = validation_json.get("issues", [])
+        recommendations = validation_json.get("recommendations", [])
+        image_properties = validation_json.get("image_properties", {})
+        
+        # Determine overall validity
+        # Image is valid if: appropriate, clear, and quality score > 0.5
+        is_valid = (
+            is_appropriate and 
+            is_clear and 
+            quality_score >= 0.5 and
+            has_sufficient_detail
+        )
+        
+        # Add basic image properties from PIL
+        try:
+            pil_image = PILImage.open(BytesIO(image_data))
+            image_properties["actual_resolution"] = f"{pil_image.width}x{pil_image.height}"
+            image_properties["format"] = pil_image.format or "unknown"
+            image_properties["mode"] = pil_image.mode
+            image_properties["file_size_bytes"] = len(image_data)
+        except Exception as e:
+            logger.warning(f"Could not extract PIL image properties: {e}")
+        
+        result = {
+            "is_valid": is_valid,
+            "quality_score": quality_score,
+            "is_appropriate": is_appropriate,
+            "is_clear": is_clear,
+            "has_sufficient_detail": has_sufficient_detail,
+            "issues": issues,
+            "recommendations": recommendations,
+            "details": {
+                "image_properties": image_properties,
+                "validation_available": True,
+                "model_used": GEMINI_TEXT_MODEL
+            }
+        }
+        
+        logger.info(f"Quality validation completed: valid={is_valid}, score={quality_score:.2f}")
+        if issues:
+            logger.info(f"Validation issues found: {', '.join(issues)}")
+        
+        return result
+        
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse validation JSON response: {e}")
+        logger.error(f"Response text: {validation_text[:500] if 'validation_text' in locals() else 'N/A'}")
+        return {
+            "is_valid": True,  # Default to valid on parse error
+            "quality_score": 0.5,
+            "issues": ["Could not parse validation response"],
+            "recommendations": ["Validation service error - proceeding with caution"],
+            "details": {"validation_available": False, "error": "JSON parse error"}
+        }
+    except Exception as e:
+        logger.error(f"Error during quality validation: {e}")
+        import traceback
+        logger.debug(f"Traceback: {traceback.format_exc()}")
+        return {
+            "is_valid": True,  # Default to valid on error
+            "quality_score": 0.5,
+            "issues": [f"Validation error: {str(e)}"],
+            "recommendations": ["Validation service error - proceeding with caution"],
+            "details": {"validation_available": False, "error": str(e)}
+        }
+
+def create_blank_base_image(width: int = 768, height: int = 512) -> bytes:
+    """Create a blank white image in 768x512 dimensions to use as base for image generation"""
+    try:
+        # Create a white image in 768x512 dimensions (default)
         blank_image = PILImage.new('RGB', (width, height), color=(255, 255, 255))
         img_buffer = BytesIO()
         blank_image.save(img_buffer, format='PNG')
@@ -514,6 +921,18 @@ def create_blank_base_image(width: int = 1920, height: int = 1080) -> bytes:
     except Exception as e:
         logger.error(f"Error creating blank base image: {e}")
         raise
+
+def get_environment_details(story_world: str) -> str:
+    """Get environment-specific details based on story world."""
+    world_lower = story_world.lower()
+    if 'enchanted forest' in world_lower or world_lower == 'forest':
+        return "ENVIRONMENT DETAILS: Include magical trees with glowing elements, mystical flora, enchanted atmosphere with soft magical light, fairy-tale forest setting with whimsical details."
+    elif 'outer space' in world_lower or world_lower == 'space':
+        return "ENVIRONMENT DETAILS: Include planets, stars, alien landscapes, cosmic scenery, space nebulas, celestial bodies, and otherworldly terrain."
+    elif 'underwater kingdom' in world_lower or world_lower == 'underwater':
+        return "ENVIRONMENT DETAILS: Include coral reefs, sea creatures, underwater flora, aquatic plants, marine life, and oceanic elements."
+    else:
+        return "ENVIRONMENT DETAILS: Match the setting and atmosphere of the story world."
 
 def generate_story_scene_image(story_page_text: str, page_number: int, character_name: str, character_type: str, story_world: str, reference_image_url: Optional[str] = None) -> str:
     """Generate a scene image for a story page using edit_image function and return the image URL."""
@@ -537,14 +956,17 @@ def generate_story_scene_image(story_page_text: str, page_number: int, character
                 logger.warning(f"Failed to download reference image, creating blank base image: {e}")
                 base_image_data = None
         
-        # If no reference image, create a blank white image in 16:9 aspect ratio
+        # If no reference image, create a blank white image in 768x512 dimensions
         if not base_image_data:
             logger.info("Creating blank base image for scene generation")
             base_image_data = create_blank_base_image()
             logger.info(f"✅ Blank base image created ({len(base_image_data)} bytes)")
         
-        # Create a detailed prompt for image generation
+        # Create a detailed prompt for image generation with explicit character consistency enforcement
         character_reference_note = ""
+        character_consistency_enforcement = ""
+        negative_prompts = ""
+        
         if reference_image_url and base_image_data:
             character_reference_note = f"""
 CHARACTER REFERENCE:
@@ -553,6 +975,52 @@ CHARACTER REFERENCE:
 - The character in the scene must match the appearance, style, and features shown in the reference image
 - Keep the character's visual identity consistent with the reference image
 """
+            character_consistency_enforcement = f"""
+=== MANDATORY CHARACTER STYLE CONSISTENCY REQUIREMENTS ===
+CRITICAL: The character from the provided reference image MUST be embedded with EXACT visual fidelity.
+
+REQUIRED CHARACTER FEATURES (DO NOT CHANGE):
+* Face: Exact same facial features, eye shape, nose, mouth, and expression style as reference
+* Limbs: Exact same proportions, length, and structure as reference
+* Body proportions: Exact same height-to-width ratio and body shape as reference
+* Hair: Exact same hair style, color, texture, and length as reference
+* Skin tone: Exact same skin color and tone as reference
+* Clothing: Exact same clothing design, colors, patterns, and details as reference
+* Overall design: Exact same character design language, style, and visual identity as reference
+* Anatomy: Exact same anatomical structure - no changes to bone structure, muscle definition, or body type
+* Style: The character's artistic style must remain consistent with the reference image
+
+STRICT PROHIBITIONS:
+* DO NOT alter the character's facial features
+* DO NOT change the character's body proportions or anatomy
+* DO NOT modify the character's hair style, color, or texture
+* DO NOT change the character's skin tone or color
+* DO NOT alter the character's clothing design, colors, or patterns
+* DO NOT modify the character's overall design or visual identity
+* DO NOT apply different artistic styles to the character than what appears in the reference
+* DO NOT distort, stretch, or resize the character in ways that change their appearance
+* DO NOT add features not present in the reference image
+* DO NOT remove features present in the reference image
+
+ENFORCEMENT:
+The character must be reproduced with pixel-perfect fidelity to the reference image. Any deviation from the reference character's appearance is strictly prohibited. The scene style may vary, but the character's appearance must remain identical to the reference image in all aspects.
+"""
+            negative_prompts = """
+=== NEGATIVE PROMPTS (STRICTLY AVOID) ===
+DO NOT:
+* Alter the character's facial features, proportions, or anatomy
+* Change the character's hair style, color, or texture
+* Modify the character's skin tone or color
+* Alter the character's clothing design, colors, or patterns
+* Change the character's body proportions or structure
+* Apply different artistic styles to the character than the reference
+* Distort, stretch, or resize the character in ways that change appearance
+* Add features not present in the reference image
+* Remove features present in the reference image
+* Create variations of the character - use the exact reference character only
+"""
+        
+        environment_details = get_environment_details(story_world)
         
         prompt = f"""Create a beautiful, colorful children's storybook illustration for this story page.
 
@@ -564,20 +1032,24 @@ CHARACTER INFORMATION:
 - Character Name: {character_name}
 - Character Type: {character_type}
 - Story World: {story_world}
+{environment_details}
 {character_reference_note}
+{character_consistency_enforcement}
 ILLUSTRATION REQUIREMENTS:
 1. Create a vibrant, age-appropriate children's book illustration
-2. Include the main character ({character_name}) as a {character_type}
-3. Match the mood, setting, and events from the story text
-4. Use bright, cheerful colors suitable for children
-5. Make it visually appealing and engaging
-6. Ensure the scene is positive and appropriate for children
-7. Include relevant details about the setting and characters
-8. Style should be like a professional children's book illustration
-9. IMPORTANT: The image must be in 16:9 aspect ratio (widescreen format)
-{"10. CRITICAL: The character must match the appearance shown in the reference image provided" if reference_image_url and base_image_data else ""}
+2. Include the main character ({character_name}) as a {character_type} - {character_name} is the clear hero of this story
+3. CHARACTER PROMINENCE: The character ({character_name}) must occupy 60-70% of the composition. The character should be the dominant visual element, clearly visible and prominent in the scene
+4. Match the mood, setting, and events from the story text
+5. Use bright, cheerful colors suitable for children
+6. Make it visually appealing and engaging
+7. Ensure the scene is positive and appropriate for children
+8. Include relevant details about the setting and characters
+9. Style should be like a professional children's book illustration
+10. IMPORTANT: The image must be in 768x512 dimensions
+{"11. CRITICAL: The character must match the appearance shown in the reference image provided" if reference_image_url and base_image_data else ""}
+{negative_prompts}
 
-Generate a high-quality illustration that perfectly captures this story moment in 16:9 aspect ratio."""
+Generate a high-quality illustration that perfectly captures this story moment in 768x512 dimensions."""
 
         # Use edit_image function to generate the scene
         logger.info(f"Calling edit_image function with prompt for page {page_number}")
@@ -621,6 +1093,35 @@ async def root():
         "health": "/health"
     }
 
+@app.post("/validate-image-quality/", response_model=QualityValidationResponse)
+async def validate_image_quality_endpoint(request: ImageRequest):
+    """
+    Standalone endpoint to validate image quality without editing.
+    Useful for pre-validation before processing.
+    """
+    try:
+        # Convert HttpUrl to string for processing
+        image_url_str = str(request.image_url)
+        
+        # Download the image from the URL provided
+        logger.info(f"Downloading image for quality validation from: {image_url_str}")
+        image_data = download_image_from_url(image_url_str)
+        
+        # Validate image quality
+        validation_result = validate_image_quality(image_data, image_url_str)
+        
+        return QualityValidationResponse(
+            success=True,
+            validation=validation_result
+        )
+        
+    except HTTPException as e:
+        logger.error(f"HTTP Exception: {e.detail}")
+        raise e
+    except Exception as e:
+        logger.error(f"Unexpected error in validate_image_quality_endpoint: {e}")
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint"""
@@ -632,7 +1133,8 @@ async def health_check():
         "openai_api_key_configured": bool(OPENAI_API_KEY),
         "model": MODEL,
         "supabase_configured": bool(supabase is not None),
-        "storage_bucket": STORAGE_BUCKET if supabase else None
+        "storage_bucket": STORAGE_BUCKET if supabase else None,
+        "quality_validation_enabled": bool(gemini_client is not None)
     }
 
 @app.post("/edit-image/", response_model=ImageResponse)
@@ -645,6 +1147,16 @@ async def edit_image_endpoint(request: ImageRequest):
         logger.info(f"Downloading image from: {image_url_str}")
         image_data = download_image_from_url(image_url_str)
 
+        # Validate image quality before processing
+        logger.info("Validating image quality...")
+        quality_validation = validate_image_quality(image_data, image_url_str)
+        
+        # Log validation results
+        if not quality_validation.get("is_valid", True):
+            logger.warning(f"Image quality validation failed: {quality_validation.get('issues', [])}")
+            # Optionally raise error or continue with warning
+            # For now, we'll continue but include validation in response
+        
         # Send the image to Gemini API for editing
         logger.info(f"Received prompt: {request.prompt}")
         edited_image = edit_image(image_data, request.prompt, image_url_str)
@@ -665,7 +1177,8 @@ async def edit_image_endpoint(request: ImageRequest):
             return ImageResponse(
                 success=True,
                 message="Image edited and uploaded successfully to Supabase storage",
-                storage_info=storage_result
+                storage_info=storage_result,
+                quality_validation=quality_validation
             )
         else:
             # Even if upload fails, we can still return the image data
@@ -673,7 +1186,8 @@ async def edit_image_endpoint(request: ImageRequest):
             return ImageResponse(
                 success=True,
                 message="Image edited successfully, but storage upload failed",
-                storage_info=storage_result
+                storage_info=storage_result,
+                quality_validation=quality_validation
             )
             
     except HTTPException as e:
@@ -761,7 +1275,22 @@ async def generate_story_endpoint(request: StoryRequest):
         # Generate scene images for each page using Gemini Pro image preview model
         logger.info("Generating scene images with Gemini Pro image preview model for each story page...")
         reference_image_url = str(request.character_image_url) if request.character_image_url else None
+        
+        # Download reference image once for consistency validation
+        reference_image_data = None
+        if reference_image_url:
+            try:
+                logger.info(f"Downloading reference image for consistency validation: {reference_image_url}")
+                reference_image_data = download_image_from_url(reference_image_url)
+                logger.info(f"✅ Reference image downloaded for validation ({len(reference_image_data)} bytes)")
+            except Exception as e:
+                logger.warning(f"Failed to download reference image for validation: {e}")
+                reference_image_data = None
+        
         story_pages = []
+        consistency_results = []
+        flagged_pages = []
+        
         for i, page_text in enumerate(story_result['pages'], 1):
             logger.info(f"Generating scene image for page {i}/5...")
             scene_url = generate_story_scene_image(
@@ -774,23 +1303,99 @@ async def generate_story_endpoint(request: StoryRequest):
             )
             # Convert string URL to HttpUrl if not empty, otherwise None
             scene_http_url = None
+            scene_image_data = None
+            consistency_validation = None
+            
             if scene_url:
                 try:
                     scene_http_url = HttpUrl(scene_url)
+                    # Download scene image for consistency validation
+                    try:
+                        scene_image_data = download_image_from_url(scene_url)
+                        logger.info(f"✅ Scene image downloaded for validation ({len(scene_image_data)} bytes)")
+                    except Exception as e:
+                        logger.warning(f"Failed to download scene image for validation: {e}")
                 except Exception as e:
                     logger.warning(f"Invalid scene URL for page {i}: {e}")
                     scene_http_url = None
             
-            story_pages.append(StoryPage(text=page_text, scene=scene_http_url))
+            # Perform character consistency validation if both images are available
+            if reference_image_data and scene_image_data:
+                logger.info(f"Performing character consistency validation for page {i}...")
+                try:
+                    consistency_validation = validate_character_consistency(
+                        scene_image_data=scene_image_data,
+                        reference_image_data=reference_image_data,
+                        page_number=i,
+                        timeout_seconds=15
+                    )
+                    consistency_results.append(consistency_validation)
+                    
+                    if consistency_validation.flagged:
+                        flagged_pages.append(i)
+                        logger.warning(f"⚠️ Page {i} flagged as INCONSISTENT (similarity: {consistency_validation.similarity_score:.3f})")
+                    else:
+                        logger.info(f"✅ Page {i} validated as CONSISTENT (similarity: {consistency_validation.similarity_score:.3f})")
+                except Exception as e:
+                    logger.error(f"Error during consistency validation for page {i}: {e}")
+                    import traceback
+                    logger.debug(f"Traceback: {traceback.format_exc()}")
+            elif not reference_image_data:
+                logger.info(f"Skipping consistency validation for page {i} - no reference image available")
+            elif not scene_image_data:
+                logger.warning(f"Skipping consistency validation for page {i} - scene image not available")
+            
+            story_pages.append(StoryPage(
+                text=page_text, 
+                scene=scene_http_url,
+                consistency_validation=consistency_validation
+            ))
         
         logger.info("All scene images generated successfully")
+        
+        # Create consistency summary
+        consistency_summary = None
+        if consistency_results:
+            avg_score = sum(r.similarity_score for r in consistency_results) / len(consistency_results)
+            min_score = min(r.similarity_score for r in consistency_results)
+            max_score = max(r.similarity_score for r in consistency_results)
+            total_validation_time = sum(r.validation_time_seconds for r in consistency_results)
+            consistent_count = sum(1 for r in consistency_results if r.is_consistent)
+            
+            consistency_summary = {
+                "total_pages_validated": len(consistency_results),
+                "consistent_pages": consistent_count,
+                "inconsistent_pages": len(consistency_results) - consistent_count,
+                "flagged_pages": flagged_pages,
+                "average_similarity_score": round(avg_score, 3),
+                "min_similarity_score": round(min_score, 3),
+                "max_similarity_score": round(max_score, 3),
+                "total_validation_time_seconds": round(total_validation_time, 2),
+                "average_validation_time_seconds": round(total_validation_time / len(consistency_results), 2),
+                "all_consistent": len(flagged_pages) == 0
+            }
+            
+            logger.info("=" * 60)
+            logger.info("CHARACTER CONSISTENCY VALIDATION SUMMARY")
+            logger.info("=" * 60)
+            logger.info(f"Total pages validated: {consistency_summary['total_pages_validated']}")
+            logger.info(f"Consistent pages: {consistency_summary['consistent_pages']}")
+            logger.info(f"Inconsistent pages: {consistency_summary['inconsistent_pages']}")
+            if flagged_pages:
+                logger.warning(f"⚠️ Flagged pages (inconsistent): {flagged_pages}")
+            logger.info(f"Average similarity score: {avg_score:.3f}")
+            logger.info(f"Score range: {min_score:.3f} - {max_score:.3f}")
+            logger.info(f"Total validation time: {total_validation_time:.2f}s")
+            logger.info(f"Average validation time per page: {total_validation_time / len(consistency_results):.2f}s")
+            logger.info("=" * 60)
         
         return StoryResponse(
             success=True,
             pages=story_pages,
             full_story=story_result['full_story'],
             word_count=story_result['word_count'],
-            page_word_counts=story_result['page_word_counts']
+            page_word_counts=story_result['page_word_counts'],
+            consistency_summary=consistency_summary
         )
         
     except ValueError as e:

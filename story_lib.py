@@ -41,6 +41,18 @@ COMPANION_TYPES = [
     "a helpful creature", "a magical helper"
 ]
 
+def get_environment_details(story_world: str) -> str:
+    """Get environment-specific details based on story world."""
+    world_lower = story_world.lower()
+    if 'enchanted forest' in world_lower or world_lower == 'forest':
+        return "Include magical trees with glowing elements, mystical flora, enchanted atmosphere with soft magical light, and fairy-tale forest setting with whimsical details."
+    elif 'outer space' in world_lower or world_lower == 'space':
+        return "Include planets, stars, alien landscapes, cosmic scenery, space nebulas, celestial bodies, and otherworldly terrain."
+    elif 'underwater kingdom' in world_lower or world_lower == 'underwater':
+        return "Include coral reefs, sea creatures, underwater flora, aquatic plants, marine life, and oceanic elements."
+    else:
+        return "Match the setting and atmosphere of the story world."
+
 CHALLENGES = {
     "3-6": [
         "find a lost treasure", "help a friend in need",
@@ -458,6 +470,7 @@ def _generate_with_api(
     client = OpenAI(api_key=api_key)
     
     age_config = AGE_CONFIGS[age_group]
+    environment_details = get_environment_details(story_world)
     
     prompt = f"""Create a personalized 5-page children's storybook.
 
@@ -469,6 +482,7 @@ CHARACTER INFORMATION:
 
 STORY CONFIGURATION:
 - World: {story_world}
+- Environment Details: {environment_details}
 - Adventure Type: {adventure_type}
 - Occasion Theme: {occasion_theme if occasion_theme else 'None'}
 
