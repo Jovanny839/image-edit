@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 MODEL = "gemini-3-pro-image-preview"
-GEMINI_TEXT_MODEL = "gemini-1.5-pro"  # Model for text generation (scenes)
+GEMINI_TEXT_MODEL = "gemini-2.5-flash"  # Model for text generation (scenes)
 
 # Supabase Configuration
 SUPABASE_URL = os.getenv("SUPABASE_URL")
