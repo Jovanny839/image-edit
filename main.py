@@ -24,6 +24,10 @@ from google.genai import types
 from google.genai.types import Image as GeminiImage
 from story_lib import generate_story
 from typing import List, Optional, Dict, Any
+from queue_manager import QueueManager
+from batch_processor import BatchProcessor
+import asyncio
+from contextlib import asynccontextmanager
 
 # Load environment variables
 load_dotenv()
@@ -72,13 +76,51 @@ if SUPABASE_URL:
 else:
     logger.warning("⚠️ Supabase URL not found. Storage upload will be disabled.")
 
+# Initialize queue manager and batch processor
+queue_manager = None
+batch_processor = None
+worker_task = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for background tasks"""
+    global queue_manager, batch_processor, worker_task
+    
+    # Initialize queue manager
+    if supabase:
+        queue_manager = QueueManager(supabase)
+        batch_processor = BatchProcessor(
+            queue_manager=queue_manager,
+            gemini_client=gemini_client,
+            openai_api_key=OPENAI_API_KEY,
+            supabase_client=supabase,
+            gemini_text_model=GEMINI_TEXT_MODEL
+        )
+        logger.info("✅ Queue manager and batch processor initialized")
+        
+        # Start background worker
+        worker_task = asyncio.create_task(background_worker())
+        logger.info("✅ Background worker started")
+    
+    yield
+    
+    # Cleanup
+    if worker_task:
+        worker_task.cancel()
+        try:
+            await worker_task
+        except asyncio.CancelledError:
+            pass
+        logger.info("✅ Background worker stopped")
+
 # FastAPI app
 app = FastAPI(
     title="AI Image Editor API",
     description="API for editing images using Google Gemini's image generation capabilities",
     version="1.0.0",
     docs_url="/docs",
-    redoc_url="/redoc"
+    redoc_url="/redoc",
+    lifespan=lifespan
 )
 
 # Add trusted host middleware (helps prevent invalid requests)
@@ -551,198 +593,17 @@ def edit_image(image_data, prompt, image_url=None):
         raise HTTPException(status_code=500, detail=f"Error from Gemini API: {str(e)}")
 
 def validate_character_consistency(scene_image_data: bytes, reference_image_data: bytes, page_number: int, timeout_seconds: int = 15) -> ConsistencyValidationResult:
-    """
-    Validate character consistency between a scene image and reference image using Gemini model.
-    Compares the character in the scene against the reference (normal.png) image.
-    
-    Args:
-        scene_image_data: Bytes of the generated scene image
-        reference_image_data: Bytes of the reference character image (normal.png)
-        page_number: Page number for logging
-        timeout_seconds: Maximum time allowed for validation (default 15 seconds)
-    
-    Returns:
-        ConsistencyValidationResult with similarity score and validation details
-    """
-    if not gemini_client:
-        logger.warning("Gemini client not available for consistency validation")
-        return ConsistencyValidationResult(
-            is_consistent=True,  # Default to consistent if validation unavailable
-            similarity_score=0.5,
-            validation_time_seconds=0.0,
-            flagged=False,
-            details={"validation_available": False, "error": "Gemini client not initialized"}
-        )
-    
-    start_time = time.time()
-    
-    try:
-        logger.info(f"Starting character consistency validation for page {page_number}...")
-        
-        # Detect MIME types
-        scene_mime_type = detect_image_mime_type(scene_image_data)
-        reference_mime_type = detect_image_mime_type(reference_image_data)
-        
-        # Encode images to base64
-        scene_base64 = base64.b64encode(scene_image_data).decode('utf-8')
-        reference_base64 = base64.b64encode(reference_image_data).decode('utf-8')
-        
-        # Create validation prompt for Gemini
-        validation_prompt = """Analyze these two images and determine how consistent the character appearance is between them.
+    """Wrapper for validation_utils.validate_character_consistency"""
+    from validation_utils import validate_character_consistency as _validate_character_consistency
+    return _validate_character_consistency(
+        scene_image_data=scene_image_data,
+        reference_image_data=reference_image_data,
+        page_number=page_number,
+        gemini_client=gemini_client,
+        gemini_text_model=GEMINI_TEXT_MODEL,
+        timeout_seconds=timeout_seconds
+    )
 
-IMAGE 1 (REFERENCE): This is the reference character image (normal.png) showing the character's standard appearance.
-
-IMAGE 2 (SCENE): This is a scene from a storybook that should contain the same character.
-
-Your task is to compare the character in the scene image against the reference image and provide a similarity score.
-
-Focus on these character features:
-1. Facial features (eyes, nose, mouth, face shape)
-2. Body proportions and structure
-3. Hair style, color, and texture
-4. Skin tone and color
-5. Clothing design, colors, and patterns
-6. Overall character design and visual style
-7. Character's artistic style consistency
-
-Return your analysis in the following JSON format (ONLY valid JSON, no additional text):
-{
-  "similarity_score": <float between 0.0 and 1.0>,
-  "is_consistent": <boolean>,
-  "character_match_details": {
-    "facial_features_match": <float 0.0-1.0>,
-    "body_proportions_match": <float 0.0-1.0>,
-    "hair_match": <float 0.0-1.0>,
-    "skin_tone_match": <float 0.0-1.0>,
-    "clothing_match": <float 0.0-1.0>,
-    "overall_style_match": <float 0.0-1.0>
-  },
-  "issues": [<array of specific inconsistency issues found>],
-  "confidence": <float 0.0-1.0>
-}
-
-Scoring guidelines:
-- 0.9-1.0: Character is nearly identical or identical to reference
-- 0.7-0.89: Character is very similar with minor differences
-- 0.5-0.69: Character is somewhat similar but has noticeable differences
-- 0.3-0.49: Character has significant differences from reference
-- 0.0-0.29: Character is very different or unrecognizable compared to reference
-
-Threshold: A score of 0.5 or higher indicates consistency. Below 0.5 should be flagged as inconsistent."""
-        
-        # Call Gemini API for validation
-        # Use timeout to ensure we complete within 15 seconds
-        validation_start = time.time()
-        
-        response = gemini_client.models.generate_content(
-            model=GEMINI_TEXT_MODEL,  # Use text model for analysis
-            contents=[
-                {
-                    "role": "user",
-                    "parts": [
-                        {"text": validation_prompt},
-                        {
-                            "inline_data": {
-                                "mime_type": reference_mime_type,
-                                "data": reference_base64
-                            }
-                        },
-                        {
-                            "text": "\n\nIMAGE 2 (SCENE):"
-                        },
-                        {
-                            "inline_data": {
-                                "mime_type": scene_mime_type,
-                                "data": scene_base64
-                            }
-                        }
-                    ]
-                }
-            ],
-            config=types.GenerateContentConfig(
-                response_modalities=['TEXT'],
-                temperature=0.1  # Lower temperature for more consistent validation
-            )
-        )
-        
-        # Extract text response
-        validation_text = ""
-        for part in response.parts:
-            if part.text:
-                validation_text += part.text
-        
-        # Check if we exceeded timeout
-        elapsed_time = time.time() - validation_start
-        if elapsed_time > timeout_seconds:
-            logger.warning(f"Consistency validation for page {page_number} exceeded timeout ({elapsed_time:.2f}s > {timeout_seconds}s)")
-        
-        # Parse JSON response
-        json_match = re.search(r'\{.*\}', validation_text, re.DOTALL)
-        if json_match:
-            validation_json = json.loads(json_match.group())
-        else:
-            validation_json = json.loads(validation_text)
-        
-        # Extract validation results
-        similarity_score = float(validation_json.get("similarity_score", 0.5))
-        is_consistent = validation_json.get("is_consistent", similarity_score >= 0.5)
-        character_match_details = validation_json.get("character_match_details", {})
-        issues = validation_json.get("issues", [])
-        confidence = validation_json.get("confidence", 0.5)
-        
-        # Determine if flagged (score < 0.5)
-        flagged = similarity_score < 0.5
-        
-        total_time = time.time() - start_time
-        
-        result = ConsistencyValidationResult(
-            is_consistent=is_consistent,
-            similarity_score=similarity_score,
-            validation_time_seconds=total_time,
-            flagged=flagged,
-            details={
-                "character_match_details": character_match_details,
-                "issues": issues,
-                "confidence": confidence,
-                "model_used": GEMINI_TEXT_MODEL,
-                "timeout_seconds": timeout_seconds
-            }
-        )
-        
-        # Log results
-        logger.info(f"✅ Consistency validation for page {page_number} completed in {total_time:.2f}s")
-        logger.info(f"   Similarity score: {similarity_score:.3f} | Consistent: {is_consistent} | Flagged: {flagged}")
-        if issues:
-            logger.warning(f"   Issues found: {', '.join(issues[:3])}")  # Log first 3 issues
-        
-        if flagged:
-            logger.warning(f"⚠️ Page {page_number} flagged as INCONSISTENT (score: {similarity_score:.3f} < 0.5)")
-        
-        return result
-        
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse consistency validation JSON response for page {page_number}: {e}")
-        logger.error(f"Response text: {validation_text[:500] if 'validation_text' in locals() else 'N/A'}")
-        total_time = time.time() - start_time
-        return ConsistencyValidationResult(
-            is_consistent=True,  # Default to consistent on parse error
-            similarity_score=0.5,
-            validation_time_seconds=total_time,
-            flagged=False,
-            details={"validation_available": False, "error": "JSON parse error", "raw_response": validation_text[:200] if 'validation_text' in locals() else None}
-        )
-    except Exception as e:
-        logger.error(f"Error during consistency validation for page {page_number}: {e}")
-        import traceback
-        logger.debug(f"Traceback: {traceback.format_exc()}")
-        total_time = time.time() - start_time
-        return ConsistencyValidationResult(
-            is_consistent=True,  # Default to consistent on error
-            similarity_score=0.5,
-            validation_time_seconds=total_time,
-            flagged=False,
-            details={"validation_available": False, "error": str(e)}
-        )
 
 def validate_image_quality(image_data: bytes, image_url: Optional[str] = None) -> Dict[str, Any]:
     """
@@ -1227,6 +1088,163 @@ async def edit_image_stream_endpoint(request: ImageRequest):
     except Exception as e:
         logger.error(f"Unexpected error in edit_image_stream_endpoint: {e}")
         raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
+
+# Request model for batch job creation
+class BatchJobRequest(BaseModel):
+    job_type: str  # 'interactive_search' or 'story_adventure'
+    character_name: str
+    character_type: str
+    special_ability: str
+    age_group: str
+    story_world: str
+    adventure_type: str
+    occasion_theme: Optional[str] = None
+    character_image_url: Optional[HttpUrl] = None
+    priority: int = 5  # 1-10, 1 is highest
+    user_id: Optional[str] = None
+    child_profile_id: Optional[int] = None
+
+# Response model for job creation
+class JobResponse(BaseModel):
+    success: bool
+    job_id: int
+    message: str
+
+# Response model for job status
+class JobStatusResponse(BaseModel):
+    job_id: int
+    status: str
+    overall_progress: int
+    stages: List[Dict[str, Any]]
+    error_message: Optional[str] = None
+    result_data: Optional[Dict[str, Any]] = None
+
+async def background_worker():
+    """Background worker that processes jobs from the queue"""
+    logger.info("Background worker started")
+    while True:
+        try:
+            if not queue_manager:
+                await asyncio.sleep(5)
+                continue
+            
+            # Get next job
+            job = queue_manager.get_next_job()
+            
+            if job:
+                job_id = job["id"]
+                logger.info(f"Processing job {job_id}")
+                await batch_processor.process_job(job_id)
+            else:
+                # No jobs available, wait before checking again
+                await asyncio.sleep(2)
+                
+        except asyncio.CancelledError:
+            logger.info("Background worker cancelled")
+            break
+        except Exception as e:
+            logger.error(f"Error in background worker: {e}")
+            await asyncio.sleep(5)
+
+@app.post("/api/books/generate", response_model=JobResponse)
+async def create_book_generation_job(request: BatchJobRequest):
+    """Create a new book generation job"""
+    try:
+        if not queue_manager:
+            raise HTTPException(
+                status_code=500,
+                detail="Queue manager not initialized"
+            )
+        
+        # Validate job_type
+        if request.job_type not in ["interactive_search", "story_adventure"]:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid job_type. Must be 'interactive_search' or 'story_adventure'"
+            )
+        
+        # Validate age_group
+        valid_age_groups = ["3-6", "7-10", "11-12"]
+        if request.age_group not in valid_age_groups:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid age_group: {request.age_group}. Must be one of: {', '.join(valid_age_groups)}"
+            )
+        
+        # Validate priority
+        if request.priority < 1 or request.priority > 10:
+            raise HTTPException(
+                status_code=400,
+                detail="Priority must be between 1 and 10 (1 is highest)"
+            )
+        
+        # Prepare job data
+        job_data = {
+            "character_name": request.character_name,
+            "character_type": request.character_type,
+            "special_ability": request.special_ability,
+            "age_group": request.age_group,
+            "story_world": request.story_world,
+            "adventure_type": request.adventure_type,
+            "occasion_theme": request.occasion_theme,
+            "character_image_url": str(request.character_image_url) if request.character_image_url else None
+        }
+        
+        # Create job
+        job = queue_manager.create_job(
+            job_type=request.job_type,
+            job_data=job_data,
+            user_id=request.user_id,
+            child_profile_id=request.child_profile_id,
+            priority=request.priority
+        )
+        
+        return JobResponse(
+            success=True,
+            job_id=job["id"],
+            message=f"Job {job['id']} created successfully"
+        )
+        
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Error creating job: {e}")
+        raise HTTPException(status_code=500, detail=f"Error creating job: {str(e)}")
+
+@app.get("/api/books/{book_id}/status", response_model=JobStatusResponse)
+async def get_book_status(book_id: int):
+    """Get the status of a book generation job"""
+    try:
+        if not queue_manager:
+            raise HTTPException(
+                status_code=500,
+                detail="Queue manager not initialized"
+            )
+        
+        job_status = queue_manager.get_job_status(book_id)
+        
+        if not job_status:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Job {book_id} not found"
+            )
+        
+        job = job_status["job"]
+        
+        return JobStatusResponse(
+            job_id=book_id,
+            status=job["status"],
+            overall_progress=job_status["overall_progress"],
+            stages=job_status["stages"],
+            error_message=job.get("error_message"),
+            result_data=job.get("result_data")
+        )
+        
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Error getting job status: {e}")
+        raise HTTPException(status_code=500, detail=f"Error getting job status: {str(e)}")
 
 @app.post("/generate-story/", response_model=StoryResponse)
 async def generate_story_endpoint(request: StoryRequest):
