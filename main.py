@@ -229,6 +229,10 @@ class StoryRequest(BaseModel):
     adventure_type: str
     occasion_theme: Optional[str] = None
     character_image_url: Optional[HttpUrl] = None  # Supabase URL of the character reference image
+    story_text_prompt: Optional[str] = None  # Full prompt for story text generation (from frontend)
+    scene_prompts: Optional[List[str]] = None  # List of 5 scene prompts, one for each page (from frontend)
+    reading_level: Optional[str] = None  # Reading level (early_reader / developing_reader / independent_reader)
+    story_title: Optional[str] = None  # Story title
     
     class Config:
         schema_extra = {
@@ -240,7 +244,11 @@ class StoryRequest(BaseModel):
                 "story_world": "the Enchanted Forest",
                 "adventure_type": "treasure hunt",
                 "occasion_theme": None,
-                "character_image_url": "https://your-project.supabase.co/storage/v1/object/public/images/character_reference.jpg"
+                "character_image_url": "https://your-project.supabase.co/storage/v1/object/public/images/character_reference.jpg",
+                "story_text_prompt": "Create a personalized 5-page children's storybook...",
+                "scene_prompts": ["Scene prompt for page 1...", "Scene prompt for page 2...", ...],
+                "reading_level": "developing_reader",
+                "story_title": "The Great Adventure of Luna"
             }
         }
 
@@ -795,8 +803,11 @@ def get_environment_details(story_world: str) -> str:
     else:
         return "ENVIRONMENT DETAILS: Match the setting and atmosphere of the story world."
 
-def generate_story_scene_image(story_page_text: str, page_number: int, character_name: str, character_type: str, story_world: str, reference_image_url: Optional[str] = None) -> str:
-    """Generate a scene image for a story page using edit_image function and return the image URL."""
+def generate_story_scene_image(story_page_text: str, page_number: int, character_name: str, character_type: str, story_world: str, reference_image_url: Optional[str] = None, scene_prompt: Optional[str] = None) -> str:
+    """Generate a scene image for a story page using edit_image function and return the image URL.
+    
+    If scene_prompt is provided, use it; otherwise generate prompt from parameters.
+    """
     if not gemini_client:
         logger.warning("Gemini client not available, returning empty scene URL")
         return ""
@@ -823,20 +834,25 @@ def generate_story_scene_image(story_page_text: str, page_number: int, character
             base_image_data = create_blank_base_image()
             logger.info(f"✅ Blank base image created ({len(base_image_data)} bytes)")
         
-        # Create a detailed prompt for image generation with explicit character consistency enforcement
-        character_reference_note = ""
-        character_consistency_enforcement = ""
-        negative_prompts = ""
-        
-        if reference_image_url and base_image_data:
-            character_reference_note = f"""
+        # Use provided prompt if available, otherwise generate one (for backward compatibility)
+        if scene_prompt:
+            prompt = scene_prompt
+            logger.info(f"Using scene prompt from frontend for page {page_number}")
+        else:
+            # Fallback: generate prompt from parameters (for backward compatibility)
+            character_reference_note = ""
+            character_consistency_enforcement = ""
+            negative_prompts = ""
+            
+            if reference_image_url and base_image_data:
+                character_reference_note = f"""
 CHARACTER REFERENCE:
 - A reference image of {character_name} is provided below
 - Use this reference image to maintain consistent character appearance across all scenes
 - The character in the scene must match the appearance, style, and features shown in the reference image
 - Keep the character's visual identity consistent with the reference image
 """
-            character_consistency_enforcement = f"""
+                character_consistency_enforcement = f"""
 === MANDATORY CHARACTER STYLE CONSISTENCY REQUIREMENTS ===
 CRITICAL: The character from the provided reference image MUST be embedded with EXACT visual fidelity.
 
@@ -866,7 +882,7 @@ STRICT PROHIBITIONS:
 ENFORCEMENT:
 The character must be reproduced with pixel-perfect fidelity to the reference image. Any deviation from the reference character's appearance is strictly prohibited. The scene style may vary, but the character's appearance must remain identical to the reference image in all aspects.
 """
-            negative_prompts = """
+                negative_prompts = """
 === NEGATIVE PROMPTS (STRICTLY AVOID) ===
 DO NOT:
 * Alter the character's facial features, proportions, or anatomy
@@ -880,10 +896,10 @@ DO NOT:
 * Remove features present in the reference image
 * Create variations of the character - use the exact reference character only
 """
-        
-        environment_details = get_environment_details(story_world)
-        
-        prompt = f"""Create a beautiful, colorful children's storybook illustration for this story page.
+            
+            environment_details = get_environment_details(story_world)
+            
+            prompt = f"""Create a beautiful, colorful children's storybook illustration for this story page.
 
 STORY PAGE TEXT (Page {page_number}):
 {story_page_text}
@@ -1285,7 +1301,8 @@ async def generate_story_endpoint(request: StoryRequest):
             adventure_type=request.adventure_type,
             occasion_theme=request.occasion_theme,
             use_api=True,  # Use OpenAI API for story generation
-            api_key=OPENAI_API_KEY
+            api_key=OPENAI_API_KEY,
+            story_text_prompt=request.story_text_prompt  # Use prompt from frontend if provided
         )
         
         logger.info(f"Story generated successfully. Word count: {story_result['word_count']}")
@@ -1311,13 +1328,25 @@ async def generate_story_endpoint(request: StoryRequest):
         
         for i, page_text in enumerate(story_result['pages'], 1):
             logger.info(f"Generating scene image for page {i}/5...")
+            # Use scene prompt from frontend if available, otherwise use None (will generate from params)
+            scene_prompt = None
+            if request.scene_prompts and len(request.scene_prompts) >= i:
+                scene_prompt = request.scene_prompts[i - 1]  # i is 1-indexed, list is 0-indexed
+                # Replace placeholder with actual page text
+                scene_prompt = scene_prompt.replace(
+                    f"[Page {i} text will be inserted here after story generation]",
+                    page_text
+                )
+                logger.info(f"Using scene prompt from frontend for page {i} (with actual page text)")
+            
             scene_url = generate_story_scene_image(
                 story_page_text=page_text,
                 page_number=i,
                 character_name=request.character_name,
                 character_type=request.character_type,
                 story_world=request.story_world,
-                reference_image_url=reference_image_url
+                reference_image_url=reference_image_url,
+                scene_prompt=scene_prompt
             )
             # Convert string URL to HttpUrl if not empty, otherwise None
             scene_http_url = None

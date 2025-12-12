@@ -368,7 +368,8 @@ def generate_story(
     adventure_type: str,
     occasion_theme: Optional[str] = None,
     use_api: bool = False,
-    api_key: Optional[str] = None
+    api_key: Optional[str] = None,
+    story_text_prompt: Optional[str] = None
 ) -> Dict[str, any]:
     """
     Generate a complete 5-page story for children.
@@ -414,7 +415,7 @@ def generate_story(
         try:
             return _generate_with_api(
                 character_name, character_type, special_ability, age_group,
-                story_world, adventure_type, occasion_theme, api_key
+                story_world, adventure_type, occasion_theme, api_key, story_text_prompt
             )
         except Exception as e:
             print(f"API error: {e}")
@@ -459,9 +460,10 @@ def _generate_with_api(
     story_world: str,
     adventure_type: str,
     occasion_theme: Optional[str],
-    api_key: str
+    api_key: str,
+    story_text_prompt: Optional[str] = None
 ) -> Dict[str, any]:
-    """Generate story using OpenAI API."""
+    """Generate story using OpenAI API. If story_text_prompt is provided, use it; otherwise generate prompt from parameters."""
     try:
         from openai import OpenAI
     except ImportError:
@@ -469,10 +471,15 @@ def _generate_with_api(
     
     client = OpenAI(api_key=api_key)
     
-    age_config = AGE_CONFIGS[age_group]
-    environment_details = get_environment_details(story_world)
-    
-    prompt = f"""Create a personalized 5-page children's storybook.
+    # Use provided prompt if available, otherwise generate one (for backward compatibility)
+    if story_text_prompt:
+        prompt = story_text_prompt
+    else:
+        # Fallback: generate prompt from parameters (for backward compatibility)
+        age_config = AGE_CONFIGS[age_group]
+        environment_details = get_environment_details(story_world)
+        
+        prompt = f"""Create a personalized 5-page children's storybook.
 
 CHARACTER INFORMATION:
 - Name: {character_name}

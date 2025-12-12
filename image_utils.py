@@ -223,9 +223,13 @@ def generate_story_scene_image(
     reference_image_url: Optional[str] = None,
     gemini_client=None,
     supabase_client=None,
-    storage_bucket: str = "images"
+    storage_bucket: str = "images",
+    scene_prompt: Optional[str] = None
 ) -> str:
-    """Generate a scene image for a story page using edit_image function and return the image URL."""
+    """Generate a scene image for a story page using edit_image function and return the image URL.
+    
+    If scene_prompt is provided, use it; otherwise generate prompt from parameters.
+    """
     if not gemini_client:
         logger.warning("Gemini client not available, returning empty scene URL")
         return ""
@@ -252,20 +256,24 @@ def generate_story_scene_image(
             base_image_data = create_blank_base_image()
             logger.info(f"✅ Blank base image created ({len(base_image_data)} bytes)")
         
-        # Create a detailed prompt for image generation
-        character_reference_note = ""
-        character_consistency_enforcement = ""
-        negative_prompts = ""
-        
-        if reference_image_url and base_image_data:
-            character_reference_note = f"""
+        # Use provided prompt if available, otherwise generate one (for backward compatibility)
+        if scene_prompt:
+            prompt = scene_prompt
+        else:
+            # Fallback: generate prompt from parameters (for backward compatibility)
+            character_reference_note = ""
+            character_consistency_enforcement = ""
+            negative_prompts = ""
+            
+            if reference_image_url and base_image_data:
+                character_reference_note = f"""
 CHARACTER REFERENCE:
 - A reference image of {character_name} is provided below
 - Use this reference image to maintain consistent character appearance across all scenes
 - The character in the scene must match the appearance, style, and features shown in the reference image
 - Keep the character's visual identity consistent with the reference image
 """
-            character_consistency_enforcement = f"""
+                character_consistency_enforcement = f"""
 === MANDATORY CHARACTER STYLE CONSISTENCY REQUIREMENTS ===
 CRITICAL: The character from the provided reference image MUST be embedded with EXACT visual fidelity.
 
@@ -280,7 +288,7 @@ REQUIRED CHARACTER FEATURES (DO NOT CHANGE):
 * Anatomy: Exact same anatomical structure - no changes to bone structure, muscle definition, or body type
 * Style: The character's artistic style must remain consistent with the reference image
 """
-            negative_prompts = """
+                negative_prompts = """
 === NEGATIVE PROMPTS (STRICTLY AVOID) ===
 DO NOT:
 * Alter the character's facial features, proportions, or anatomy
@@ -294,10 +302,10 @@ DO NOT:
 * Remove features present in the reference image
 * Create variations of the character - use the exact reference character only
 """
-        
-        environment_details = get_environment_details(story_world)
-        
-        prompt = f"""Create a beautiful, colorful children's storybook illustration for this story page.
+            
+            environment_details = get_environment_details(story_world)
+            
+            prompt = f"""Create a beautiful, colorful children's storybook illustration for this story page.
 
 STORY PAGE TEXT (Page {page_number}):
 {story_page_text}
