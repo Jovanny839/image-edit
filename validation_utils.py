@@ -7,7 +7,7 @@ import base64
 import time
 import json
 import re
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from pydantic import BaseModel
 from image_utils import detect_image_mime_type
 from google.genai import types
@@ -20,7 +20,7 @@ class ConsistencyValidationResult(BaseModel):
     similarity_score: float  # 0.0 to 1.0
     validation_time_seconds: float
     flagged: bool  # True if score < 0.5
-    details: Dict[str, Any] = None
+    details: Optional[Dict[str, Any]] = None
 
 
 def validate_character_consistency(

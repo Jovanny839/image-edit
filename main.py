@@ -26,6 +26,7 @@ from story_lib import generate_story
 from typing import List, Optional, Dict, Any
 from queue_manager import QueueManager
 from batch_processor import BatchProcessor
+from validation_utils import ConsistencyValidationResult
 import asyncio
 from contextlib import asynccontextmanager
 
@@ -251,14 +252,6 @@ class StoryRequest(BaseModel):
                 "story_title": "The Great Adventure of Luna"
             }
         }
-
-# Model for character consistency validation results
-class ConsistencyValidationResult(BaseModel):
-    is_consistent: bool
-    similarity_score: float  # 0.0 to 1.0
-    validation_time_seconds: float
-    flagged: bool  # True if score < 0.5
-    details: Optional[Dict[str, Any]] = None
 
 # Page model for story pages with text and scene image
 class StoryPage(BaseModel):
