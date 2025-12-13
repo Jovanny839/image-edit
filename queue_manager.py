@@ -4,6 +4,8 @@ Replaces Bull Queue with Supabase as the backend storage
 """
 
 import logging
+import time
+import ssl
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 from supabase import Client
@@ -43,6 +45,42 @@ class QueueManager:
     
     def __init__(self, supabase_client: Client):
         self.supabase = supabase_client
+        self.max_retries = 3
+        self.retry_delay = 1  # Initial delay in seconds
+    
+    def _is_ssl_error(self, error: Exception) -> bool:
+        """Check if error is an SSL-related error"""
+        error_str = str(error).lower()
+        error_type = type(error).__name__
+        return (
+            'ssl' in error_str or 
+            'ssl' in error_type.lower() or
+            'unexpected_eof' in error_str or
+            'eof' in error_str or
+            'connection' in error_str
+        )
+    
+    def _retry_with_backoff(self, func, *args, **kwargs):
+        """Retry a function with exponential backoff for SSL errors"""
+        last_error = None
+        for attempt in range(self.max_retries):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                last_error = e
+                if self._is_ssl_error(e):
+                    if attempt < self.max_retries - 1:
+                        delay = self.retry_delay * (2 ** attempt)  # Exponential backoff
+                        logger.warning(f"SSL error on attempt {attempt + 1}/{self.max_retries}: {e}. Retrying in {delay}s...")
+                        time.sleep(delay)
+                        continue
+                    else:
+                        logger.error(f"SSL error after {self.max_retries} attempts: {e}")
+                else:
+                    # Not an SSL error, don't retry
+                    raise
+        # If we get here, all retries failed
+        raise last_error
     
     def create_job(
         self,
@@ -82,7 +120,10 @@ class QueueManager:
             if child_profile_id:
                 job_record["child_profile_id"] = child_profile_id
             
-            result = self.supabase.table("book_generation_jobs").insert(job_record).execute()
+            def _execute_insert():
+                return self.supabase.table("book_generation_jobs").insert(job_record).execute()
+            
+            result = self._retry_with_backoff(_execute_insert)
             
             if result.data and len(result.data) > 0:
                 job = result.data[0]
@@ -91,8 +132,14 @@ class QueueManager:
             else:
                 raise Exception("Failed to create job: No data returned")
                 
+        except ssl.SSLError as ssl_error:
+            logger.error(f"SSL error creating job: {ssl_error}")
+            raise
         except Exception as e:
-            logger.error(f"Error creating job: {e}")
+            if self._is_ssl_error(e):
+                logger.error(f"SSL-related error creating job: {e}")
+            else:
+                logger.error(f"Error creating job: {e}")
             raise
     
     def get_next_job(self, job_type: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -106,24 +153,34 @@ class QueueManager:
             Job record or None if no jobs available
         """
         try:
-            query = self.supabase.table("book_generation_jobs").select("*")
+            def _execute_query():
+                query = self.supabase.table("book_generation_jobs").select("*")
+                
+                if job_type:
+                    query = query.eq("job_type", job_type)
+                
+                query = query.eq("status", JobStatus.PENDING.value)
+                query = query.order("priority", desc=False)  # Lower priority number = higher priority
+                query = query.order("created_at", desc=False)  # FIFO for same priority
+                query = query.limit(1)
+                
+                return query.execute()
             
-            if job_type:
-                query = query.eq("job_type", job_type)
-            
-            query = query.eq("status", JobStatus.PENDING.value)
-            query = query.order("priority", desc=False)  # Lower priority number = higher priority
-            query = query.order("created_at", desc=False)  # FIFO for same priority
-            query = query.limit(1)
-            
-            result = query.execute()
+            result = self._retry_with_backoff(_execute_query)
             
             if result.data and len(result.data) > 0:
                 return result.data[0]
             return None
             
+        except ssl.SSLError as ssl_error:
+            logger.error(f"SSL error getting next job: {ssl_error}")
+            logger.error(f"   Error type: {type(ssl_error).__name__}")
+            return None
         except Exception as e:
-            logger.error(f"Error getting next job: {e}")
+            if self._is_ssl_error(e):
+                logger.error(f"SSL-related error getting next job: {e}")
+            else:
+                logger.error(f"Error getting next job: {e}")
             return None
     
     def claim_job(self, job_id: int) -> bool:
@@ -137,18 +194,27 @@ class QueueManager:
             True if successfully claimed, False otherwise
         """
         try:
-            result = self.supabase.table("book_generation_jobs").update({
-                "status": JobStatus.PROCESSING.value,
-                "started_at": datetime.utcnow().isoformat()
-            }).eq("id", job_id).eq("status", JobStatus.PENDING.value).execute()
+            def _execute_update():
+                return self.supabase.table("book_generation_jobs").update({
+                    "status": JobStatus.PROCESSING.value,
+                    "started_at": datetime.utcnow().isoformat()
+                }).eq("id", job_id).eq("status", JobStatus.PENDING.value).execute()
+            
+            result = self._retry_with_backoff(_execute_update)
             
             if result.data and len(result.data) > 0:
                 logger.info(f"Claimed job {job_id} for processing")
                 return True
             return False
             
+        except ssl.SSLError as ssl_error:
+            logger.error(f"SSL error claiming job {job_id}: {ssl_error}")
+            return False
         except Exception as e:
-            logger.error(f"Error claiming job {job_id}: {e}")
+            if self._is_ssl_error(e):
+                logger.error(f"SSL-related error claiming job {job_id}: {e}")
+            else:
+                logger.error(f"Error claiming job {job_id}: {e}")
             return False
     
     def update_job_status(
@@ -182,22 +248,33 @@ class QueueManager:
             if status == JobStatus.COMPLETED:
                 update_data["completed_at"] = datetime.utcnow().isoformat()
             
-            result = self.supabase.table("book_generation_jobs").update(update_data).eq("id", job_id).execute()
+            def _execute_update():
+                return self.supabase.table("book_generation_jobs").update(update_data).eq("id", job_id).execute()
+            
+            result = self._retry_with_backoff(_execute_update)
             
             if result.data and len(result.data) > 0:
                 logger.info(f"Updated job {job_id} status to {status.value}")
                 return True
             return False
             
+        except ssl.SSLError as ssl_error:
+            logger.error(f"SSL error updating job {job_id} status: {ssl_error}")
+            return False
         except Exception as e:
-            logger.error(f"Error updating job {job_id} status: {e}")
+            if self._is_ssl_error(e):
+                logger.error(f"SSL-related error updating job {job_id} status: {e}")
+            else:
+                logger.error(f"Error updating job {job_id} status: {e}")
             return False
     
     def increment_retry_count(self, job_id: int) -> bool:
         """Increment retry count for a job"""
         try:
-            # Get current retry count
-            job = self.supabase.table("book_generation_jobs").select("retry_count, max_retries").eq("id", job_id).execute()
+            def _get_job():
+                return self.supabase.table("book_generation_jobs").select("retry_count, max_retries").eq("id", job_id).execute()
+            
+            job = self._retry_with_backoff(_get_job)
             
             if not job.data or len(job.data) == 0:
                 return False
@@ -215,18 +292,27 @@ class QueueManager:
                     error_message=f"Job failed after {max_retries} retries"
                 )
             
-            result = self.supabase.table("book_generation_jobs").update({
-                "retry_count": new_retry_count,
-                "status": JobStatus.PENDING.value  # Reset to pending for retry
-            }).eq("id", job_id).execute()
+            def _execute_update():
+                return self.supabase.table("book_generation_jobs").update({
+                    "retry_count": new_retry_count,
+                    "status": JobStatus.PENDING.value  # Reset to pending for retry
+                }).eq("id", job_id).execute()
+            
+            result = self._retry_with_backoff(_execute_update)
             
             if result.data and len(result.data) > 0:
                 logger.info(f"Incremented retry count for job {job_id} to {new_retry_count}")
                 return True
             return False
             
+        except ssl.SSLError as ssl_error:
+            logger.error(f"SSL error incrementing retry count for job {job_id}: {ssl_error}")
+            return False
         except Exception as e:
-            logger.error(f"Error incrementing retry count for job {job_id}: {e}")
+            if self._is_ssl_error(e):
+                logger.error(f"SSL-related error incrementing retry count for job {job_id}: {e}")
+            else:
+                logger.error(f"Error incrementing retry count for job {job_id}: {e}")
             return False
     
     def create_stage(
@@ -257,15 +343,24 @@ class QueueManager:
             if scene_index is not None:
                 stage_record["scene_index"] = scene_index
             
-            result = self.supabase.table("job_stages").insert(stage_record).execute()
+            def _execute_insert():
+                return self.supabase.table("job_stages").insert(stage_record).execute()
+            
+            result = self._retry_with_backoff(_execute_insert)
             
             if result.data and len(result.data) > 0:
                 return result.data[0]
             else:
                 raise Exception("Failed to create stage: No data returned")
                 
+        except ssl.SSLError as ssl_error:
+            logger.error(f"SSL error creating stage: {ssl_error}")
+            raise
         except Exception as e:
-            logger.error(f"Error creating stage: {e}")
+            if self._is_ssl_error(e):
+                logger.error(f"SSL-related error creating stage: {e}")
+            else:
+                logger.error(f"Error creating stage: {e}")
             raise
     
     def update_stage_status(
@@ -307,31 +402,51 @@ class QueueManager:
             if status in [StageStatus.COMPLETED, StageStatus.FAILED, StageStatus.SKIPPED]:
                 update_data["completed_at"] = datetime.utcnow().isoformat()
             
-            result = self.supabase.table("job_stages").update(update_data).eq("id", stage_id).execute()
+            def _execute_update():
+                return self.supabase.table("job_stages").update(update_data).eq("id", stage_id).execute()
+            
+            result = self._retry_with_backoff(_execute_update)
             
             if result.data and len(result.data) > 0:
                 logger.info(f"Updated stage {stage_id} status to {status.value}")
                 return True
             return False
             
+        except ssl.SSLError as ssl_error:
+            logger.error(f"SSL error updating stage {stage_id} status: {ssl_error}")
+            return False
         except Exception as e:
-            logger.error(f"Error updating stage {stage_id} status: {e}")
+            if self._is_ssl_error(e):
+                logger.error(f"SSL-related error updating stage {stage_id} status: {e}")
+            else:
+                logger.error(f"Error updating stage {stage_id} status: {e}")
             return False
     
     def get_job_stages(self, job_id: int) -> List[Dict[str, Any]]:
         """Get all stages for a job"""
         try:
-            result = self.supabase.table("job_stages").select("*").eq("job_id", job_id).order("created_at", desc=False).execute()
+            def _get_stages():
+                return self.supabase.table("job_stages").select("*").eq("job_id", job_id).order("created_at", desc=False).execute()
+            
+            result = self._retry_with_backoff(_get_stages)
             return result.data if result.data else []
+        except ssl.SSLError as ssl_error:
+            logger.error(f"SSL error getting job stages for {job_id}: {ssl_error}")
+            return []
         except Exception as e:
-            logger.error(f"Error getting job stages: {e}")
+            if self._is_ssl_error(e):
+                logger.error(f"SSL-related error getting job stages for {job_id}: {e}")
+            else:
+                logger.error(f"Error getting job stages for {job_id}: {e}")
             return []
     
     def get_job_status(self, job_id: int) -> Optional[Dict[str, Any]]:
         """Get job status with all stages"""
         try:
-            # Get job
-            job_result = self.supabase.table("book_generation_jobs").select("*").eq("id", job_id).execute()
+            def _get_job():
+                return self.supabase.table("book_generation_jobs").select("*").eq("id", job_id).execute()
+            
+            job_result = self._retry_with_backoff(_get_job)
             
             if not job_result.data or len(job_result.data) == 0:
                 return None
@@ -355,7 +470,13 @@ class QueueManager:
                 "overall_progress": overall_progress
             }
             
+        except ssl.SSLError as ssl_error:
+            logger.error(f"SSL error getting job status for {job_id}: {ssl_error}")
+            return None
         except Exception as e:
-            logger.error(f"Error getting job status: {e}")
+            if self._is_ssl_error(e):
+                logger.error(f"SSL-related error getting job status for {job_id}: {e}")
+            else:
+                logger.error(f"Error getting job status for {job_id}: {e}")
             return None
 

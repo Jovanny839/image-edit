@@ -10,6 +10,7 @@ import time
 import uvicorn
 import json
 import re
+import ssl
 from io import BytesIO
 from fastapi.responses import StreamingResponse
 import logging
@@ -1131,6 +1132,9 @@ class JobStatusResponse(BaseModel):
 async def background_worker():
     """Background worker that processes jobs from the queue"""
     logger.info("Background worker started")
+    consecutive_errors = 0
+    max_consecutive_errors = 10
+    
     while True:
         try:
             if not queue_manager:
@@ -1143,10 +1147,49 @@ async def background_worker():
             if job:
                 job_id = job["id"]
                 logger.info(f"Processing job {job_id}")
+                consecutive_errors = 0  # Reset error counter on successful job fetch
                 await batch_processor.process_job(job_id)
             else:
                 # No jobs available, wait before checking again
+                consecutive_errors = 0  # Reset error counter when no jobs (not an error)
                 await asyncio.sleep(2)
+                
+        except asyncio.CancelledError:
+            logger.info("Background worker cancelled")
+            break
+        except ssl.SSLError as ssl_error:
+            consecutive_errors += 1
+            logger.error(f"SSL error in background worker (error #{consecutive_errors}): {ssl_error}")
+            
+            if consecutive_errors >= max_consecutive_errors:
+                logger.error(f"Too many consecutive SSL errors ({consecutive_errors}). Waiting longer before retry...")
+                await asyncio.sleep(30)  # Wait longer after many errors
+                consecutive_errors = 0  # Reset after long wait
+            else:
+                # Exponential backoff for SSL errors
+                wait_time = min(2 ** consecutive_errors, 30)  # Cap at 30 seconds
+                logger.warning(f"Waiting {wait_time}s before retry due to SSL error...")
+                await asyncio.sleep(wait_time)
+                
+        except Exception as e:
+            error_str = str(e).lower()
+            if 'ssl' in error_str or 'eof' in error_str or 'connection' in error_str:
+                consecutive_errors += 1
+                logger.error(f"SSL-related error in background worker (error #{consecutive_errors}): {e}")
+                
+                if consecutive_errors >= max_consecutive_errors:
+                    logger.error(f"Too many consecutive SSL errors ({consecutive_errors}). Waiting longer before retry...")
+                    await asyncio.sleep(30)
+                    consecutive_errors = 0
+                else:
+                    wait_time = min(2 ** consecutive_errors, 30)
+                    logger.warning(f"Waiting {wait_time}s before retry due to SSL-related error...")
+                    await asyncio.sleep(wait_time)
+            else:
+                # Non-SSL error, log and continue
+                logger.error(f"Error in background worker: {e}")
+                consecutive_errors = 0  # Reset for non-SSL errors
+                await asyncio.sleep(5)  # Wait a bit before retrying
                 
         except asyncio.CancelledError:
             logger.info("Background worker cancelled")
